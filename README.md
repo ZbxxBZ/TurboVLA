@@ -30,6 +30,8 @@ This repository contains the official implementation of **TurboVLA** for the pap
 - `2026.07.31`: Released the TurboVLA model checkpoints on [Hugging Face](https://huggingface.co/H-EmbodVis/TurboVLA).
 - `2026.07.30`: Released the paper, training and evaluation code.
 
+## 📅 TODO
+* [ ] Support Huawei Ascend NPUs
 ---
 
 ## 📄 Abstract
