@@ -1,0 +1,10 @@
+click_alarmclock
+click_bell
+move_pillbottle_pad
+place_phone_stand
+stack_blocks_three
+stamp_seal
+turn_switch
+open_microwave
+adjust_bottle
+blocks_ranking_rgb

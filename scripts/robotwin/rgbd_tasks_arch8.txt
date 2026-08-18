@@ -1,0 +1,8 @@
+press_stapler
+beat_block_hammer
+hanging_mug
+stack_blocks_two
+place_object_scale
+place_can_basket
+open_laptop
+lift_pot

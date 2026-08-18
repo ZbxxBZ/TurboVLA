@@ -1,0 +1,141 @@
+run_id: turbovla_robotwin_rgbd_arch18_200_depth_8ep
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: turbovla_robotwin_depth
+is_debug: false
+version_id: "0.1"
+
+framework:
+  name: TurboVLA
+  text:
+    bert_path: ${oc.env:BERT_MODEL_PATH}
+    max_text_len: 256
+    sub_sentence_present: true
+    local_files_only: true
+    freeze_text_encoder: true
+    attn_implementation: flash_attention_2
+  vision:
+    model_path: ${oc.env:DINOV3_MODEL_PATH}
+    image_size: 224
+    num_views: 3
+    local_files_only: true
+    freeze_vision_encoder: true
+    attn_implementation: flash_attention_2
+    position_init_std: 0.01
+    position_scale_init: 0.01
+    dropout: 0.1
+  depth:
+    # RoboTwin 保存真实毫米深度；该分支不运行 Depth Anything，而是直接编码度量深度。
+    enabled: true
+    image_size: 224
+    num_views: 3
+    hidden_dim: 256
+    patch_size: 16
+    input_unit: millimeter
+    depth_scale: 1000.0
+    min_depth_m: 0.05
+    max_depth_m: 5.0
+    use_log_depth: true
+    invalid_threshold: 0.5
+    freeze_depth_encoder: false
+    dropout: 0.0
+  depth_fusion:
+    # Language-conditioned RGB tokens query all valid depth patches in the corresponding view.
+    enabled: true
+    mode: global
+    hidden_dim: 256
+    nheads: 8
+    dropout: 0.0
+    # Legacy checkpoints keep tanh semantics by default. This recipe uses a
+    # positive bounded gate so the depth branch cannot collapse back to zero.
+    gate_init: 0.08
+    gate_parameterization: bounded_sigmoid
+    gate_min: 0.02
+    gate_max: 0.30
+  interaction:
+    hidden_dim: 256
+    nheads: 8
+    dim_feedforward: 2048
+    enhancer_inner_dim: 1024
+    num_layers: 6
+    text_dropout: 0.0
+    fusion_dropout: 0.0
+    fusion_droppath: 0.1
+    padding_strategy: zero_fill
+    residual_style: pre_norm
+    attention_backend: sdpa
+    compute_precision: bf16_autocast
+  initialization:
+    pretrained_ckpt: ${oc.env:TURBOVLA_INIT_CKPT}
+    load_pretrained: true
+    load_full_model: true
+    load_bert: true
+    load_text_projection: true
+    load_interaction: true
+  action:
+    action_dim: 14
+    state_dim: 14
+    horizon: 50
+    num_layers: 3
+    dropout: 0.1
+    num_state_tokens: 2
+    state_hidden_dim: 256
+    mlp_hidden_dim: 512
+    loss_type: l1
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: ${oc.env:ROBOTWIN_DATA_ROOT}
+    data_mix: robotwin_rgbd_arch18_200
+    # 独立元数据只为深度实验使用，不覆盖原始 meta/modality.json。
+    modality_metadata_path: experiments/robotwin/configs/modality_depth.json
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 8
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    video_backend: pyav
+    num_workers: 8
+    prefetch_factor: 4
+    persistent_workers: true
+    pin_memory: true
+
+trainer:
+  use_deepspeed: true
+  max_train_steps: 20392
+  num_warmup_steps: 1000
+  save_interval: 2549
+  eval_interval: 1000
+  learning_rate:
+    base: 5.0e-05
+    # 深度模块使用较大学习率；预训练交互层和完整动作头使用较小学习率适应深度特征。
+    depth_encoder: 1.0e-04
+    depth_fusion: 1.0e-04
+    vision_language_interaction: 5.0e-06
+    action_head: 1.0e-05
+  lr_scheduler_type: warmup_constant_with_factor
+  scheduler_specific_kwargs:
+    warmup_start_factor: 0.0
+  # Only the two pretrained backbones stay frozen; every projection, position
+  # parameter, fusion layer, and action-head parameter remains trainable.
+  freeze_modules: vision_encoder.backbone, text_encoder.bert
+  train_modules: ""
+  max_grad_norm: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-10
+  save_format: pt
+  ema_decay: 0.999
+  ema_device: cuda
+  depth_gate_warmup_steps: 0
+  depth_gate_warmup_start: 0.02
+  depth_gate_warmup_end: 0.08
+  logging_frequency: 50
