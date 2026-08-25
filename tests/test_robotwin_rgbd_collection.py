@@ -29,7 +29,7 @@ def _write_episode(path: Path, *, include_depth: bool = True) -> None:
         for camera in ("head_camera", "left_camera", "right_camera"):
             camera_group = observation.create_group(camera)
             camera_group.create_dataset("rgb", data=[encoded] * 3, dtype=f"S{len(encoded)}")
-            if include_depth:
+            if include_depth and camera == "head_camera":
                 camera_group.create_dataset(
                     "depth", data=np.full((3, 6, 8), 750.0, dtype=np.float64)
                 )
@@ -47,9 +47,10 @@ def _write_xpolicylab_episode(path: Path) -> None:
             camera_group.create_dataset(
                 "colors", data=[encoded] * 3, dtype=f"S{len(encoded)}"
             )
-            camera_group.create_dataset(
-                "depths", data=np.full((3, 6, 8), 750.0, dtype=np.float64)
-            )
+            if camera == "cam_head":
+                camera_group.create_dataset(
+                    "depths", data=np.full((3, 6, 8), 750.0, dtype=np.float64)
+                )
         for group_name in ("state", "action"):
             group = handle.create_group(group_name)
             for field, width in (
@@ -59,6 +60,10 @@ def _write_xpolicylab_episode(path: Path) -> None:
                 ("right_ee_joint_states", 1),
             ):
                 group.create_dataset(field, data=np.zeros((3, width), dtype=np.float32))
+        pointclouds = np.zeros((3, 1024, 6), dtype=np.float32)
+        pointclouds[..., 2] = 0.75
+        pointclouds[..., 3:] = 0.5
+        handle.create_dataset("pointclouds", data=pointclouds)
 
 
 def test_validate_complete_rgbd_episode(tmp_path: Path) -> None:
@@ -90,7 +95,21 @@ def test_validate_xpolicylab_rgbd_episode(tmp_path: Path) -> None:
 
     assert result.valid
     assert result.frames == 3
-    assert result.depth_shapes["left_camera"] == [3, 6, 8]
+    assert result.depth_shapes == {"head_camera": [3, 6, 8]}
+
+
+def test_validate_rejects_extra_third_view(tmp_path: Path) -> None:
+    episode = tmp_path / "episode_0000000.hdf5"
+    _write_xpolicylab_episode(episode)
+    encoded = _jpeg_bytes()
+    with h5py.File(episode, "r+") as handle:
+        camera = handle["vision"].create_group("cam_third_view")
+        camera.create_dataset("colors", data=[encoded] * 3, dtype=f"S{len(encoded)}")
+
+    result = validate_episode(episode)
+
+    assert not result.valid
+    assert "cam_third_view" in result.error
 
 
 def test_scan_task_supports_new_and_old_robotwin_layouts(tmp_path: Path) -> None:

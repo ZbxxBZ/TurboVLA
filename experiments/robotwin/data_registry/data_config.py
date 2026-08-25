@@ -195,4 +195,14 @@ DATASET_NAMED_MIXTURES = {
         (f"Clean/{task_name}", 1.0, "robotwin50_depth")
         for task_name in _RGBD_ARCH18_200_TASKS
     ],
+    # The depth-aware policy predicts geometry from cam_head RGB. Ground-truth
+    # depth remains exclusive to the standalone stage-one supervision dataset.
+    "robotwin_depthaware_arch18_200": [
+        (f"Clean/{task_name}", 1.0, "robotwin50")
+        for task_name in _RGBD_ARCH18_200_TASKS
+    ],
+    "robotwin_depthaware_clean50_360": [
+        (f"Clean/{task_name}", 1.0, "robotwin50")
+        for task_name in _CLEAN50_TASKS
+    ],
 }

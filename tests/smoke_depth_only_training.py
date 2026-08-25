@@ -41,6 +41,10 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bert-path", required=True)
     parser.add_argument("--dinov3-path", required=True)
+    parser.add_argument("--depth-dinov3-repo", required=True)
+    parser.add_argument("--depth-backbone-weights", required=True)
+    parser.add_argument("--depth-head-weights", required=True)
+    parser.add_argument("--depth-projection-weights", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=2)
@@ -80,6 +84,12 @@ def main() -> None:
 
     os.environ["BERT_MODEL_PATH"] = str(Path(args.bert_path).resolve())
     os.environ["DINOV3_MODEL_PATH"] = str(Path(args.dinov3_path).resolve())
+    os.environ["DEPTH_DINOV3_REPO_PATH"] = str(Path(args.depth_dinov3_repo).resolve())
+    os.environ["DEPTH_DINOV3_BACKBONE_WEIGHTS"] = str(Path(args.depth_backbone_weights).resolve())
+    os.environ["DEPTH_DINOV3_HEAD_WEIGHTS"] = str(Path(args.depth_head_weights).resolve())
+    os.environ["DEPTH_DINOV3_PROJECTION_WEIGHTS"] = str(
+        Path(args.depth_projection_weights).resolve()
+    )
     os.environ["TURBOVLA_INIT_CKPT"] = str(Path(args.checkpoint).resolve())
     os.environ.setdefault("ROBOTWIN_DATA_ROOT", str(REPO_ROOT / "unused-smoke-data"))
 
@@ -118,6 +128,8 @@ def main() -> None:
     frozen_prefixes = (
         "model.vision_encoder.backbone.",
         "model.text_encoder.bert.",
+        "model.depth_encoder.backbone.",
+        "model.depth_encoder.depth_head.",
     )
     unexpected_trainable = [name for name in trainable_names if name.startswith(frozen_prefixes)]
     if unexpected_trainable:
@@ -129,7 +141,8 @@ def main() -> None:
     required_trainable_prefixes = (
         "model.text_encoder.text_projection.",
         "model.vision_projection.",
-        "model.depth_encoder.",
+        "model.depth_encoder.token_projection.",
+        "model.depth_encoder.token_norm.",
         "model.depth_fusion.",
         "model.vision_language_interaction.",
         "model.action_head.state_projection.",
@@ -139,27 +152,19 @@ def main() -> None:
         if not any(name.startswith(prefix) for name in trainable_names):
             raise AssertionError(f"expected trainable module is missing: {prefix}")
     if not any(name.startswith("model.depth_encoder.") for name in trainable_names):
-        raise AssertionError("MetricDepthEncoder has no trainable parameters")
+        raise AssertionError("DINOv3DepthEncoder has no trainable parameters")
     if not any(name.startswith("model.depth_fusion.") for name in trainable_names):
         raise AssertionError("GatedDepthCrossAttention has no trainable parameters")
 
     device = torch.device(args.device)
     model.to(device)
     model.train()
+    model.depth_fusion.set_gate_override(0.15)
     frozen_before = _parameter_hashes(model, trainable=False)
     trainable_before = _parameter_hashes(model, trainable=True)
 
     generator = torch.Generator(device=device).manual_seed(42)
     pixel_values = torch.randn(1, 3, 3, 224, 224, generator=generator, device=device)
-    depth_values = torch.randint(
-        200,
-        1801,
-        (1, 3, 1, 224, 224),
-        generator=generator,
-        device=device,
-        dtype=torch.int32,
-    ).float()
-    depth_values[:, 0, :, :16, :16] = 0.0
     state = torch.zeros(1, 14, device=device)
     target = torch.zeros(1, 50, 14, device=device)
     instructions = ["pick up the object"]
@@ -172,9 +177,11 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         predicted = model.model(
             instructions,
-            {"dinov3": pixel_values, "depth": depth_values},
+            {"dinov3": pixel_values},
             state,
         )
+        if tuple(predicted.shape) != (1, 50, 14):
+            raise AssertionError(f"unexpected action shape: {tuple(predicted.shape)}")
         loss = F.l1_loss(predicted.float(), target)
         if not torch.isfinite(loss):
             raise AssertionError(f"step {step} produced a non-finite loss: {loss.item()}")
@@ -183,12 +190,26 @@ def main() -> None:
         gate_grad = _parameter_grad_l1(model.depth_fusion.depth_gate)
         encoder_grad = _grad_l1(model.depth_encoder)
         attention_grad = _grad_l1(model.depth_fusion.cross_attention)
-        if gate_grad <= 0.0:
-            raise AssertionError(f"step {step} did not produce a depth gate gradient")
-        if encoder_grad <= 0.0 or attention_grad <= 0.0:
+        if gate_grad != 0.0:
+            raise AssertionError(f"fixed depth gate unexpectedly received a gradient at step {step}")
+        if attention_grad <= 0.0:
+            raise AssertionError(f"step {step} did not update the depth cross-attention")
+        if step >= 2 and encoder_grad <= 0.0:
             raise AssertionError(
-                "nonzero bounded gate must pass gradients into the depth branch from step 1: "
-                f"step={step}, encoder={encoder_grad}, attention={attention_grad}"
+                "the depth encoder must receive gradients after the zero-initialized output projection "
+                f"has taken one optimizer step: step={step}, encoder={encoder_grad}"
+            )
+
+        residual_ratio = model.depth_fusion.residual_ratio()
+        residual_ratio_mean = (
+            residual_ratio.detach().float().mean().item() if residual_ratio is not None else None
+        )
+        effective_gate = model.depth_fusion.effective_gate().detach().float().abs().mean().item()
+        if abs(effective_gate - 0.15) > 1e-6:
+            raise AssertionError(f"expected fixed gate 0.15, got {effective_gate}")
+        if step >= 2 and (residual_ratio_mean is None or residual_ratio_mean <= 0.0):
+            raise AssertionError(
+                f"depth residual must become nonzero by step 2, got {residual_ratio_mean}"
             )
 
         optimizer.step()
@@ -202,9 +223,8 @@ def main() -> None:
                 "gate_grad_l1": gate_grad,
                 "encoder_grad_l1": encoder_grad,
                 "cross_attention_grad_l1": attention_grad,
-                "effective_gate_abs_mean": (
-                    model.depth_fusion.effective_gate().detach().float().abs().mean().item()
-                ),
+                "depth_residual_ratio_mean": residual_ratio_mean,
+                "effective_gate_abs_mean": effective_gate,
             }
         )
 

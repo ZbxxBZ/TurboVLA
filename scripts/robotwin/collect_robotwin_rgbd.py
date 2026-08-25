@@ -105,6 +105,8 @@ def stage_config(
     data_type = config.setdefault("data_type", {})
     camera = config.setdefault("camera", {})
     data_type.update({"rgb": True, "depth": True, "qpos": True, "endpose": True})
+    # Preserve all three RGB views. The RoboTwin HDF5 patch keeps depth only
+    # for the fixed head camera.
     camera.update({"collect_head_camera": True, "collect_wrist_camera": True})
     config.update({"render_freq": 0, "collect_data": True})
 
@@ -155,9 +157,10 @@ def render_smoke_test(
         raise FileNotFoundError(f"RoboTwin render probe is missing: {test_script}")
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    def probe(gpu: str) -> tuple[str, bool, str]:
+    def probe(slot_and_gpu: tuple[int, str]) -> tuple[int, str, bool, str]:
+        slot, gpu = slot_and_gpu
         gpu_safe = re.sub(r"[^A-Za-z0-9_.-]", "_", gpu)
-        log_path = log_dir / f"render_smoke_gpu_{gpu_safe}.log"
+        log_path = log_dir / f"render_smoke_slot_{slot:02d}_gpu_{gpu_safe}.log"
         outputs: list[str] = []
         for attempt in range(1, 4):
             try:
@@ -173,20 +176,24 @@ def render_smoke_test(
                 outputs.append(f"=== attempt {attempt}/3 ===\n{output}")
                 if result.returncode == 0 and "Render Well" in output:
                     log_path.write_text("\n".join(outputs), encoding="utf-8")
-                    return gpu, True, str(log_path)
+                    return slot, gpu, True, str(log_path)
             except subprocess.TimeoutExpired as error:
                 output = (error.stdout or "") + (error.stderr or "")
                 outputs.append(f"=== attempt {attempt}/3 timed out ===\n{output}")
             if attempt < 3:
                 time.sleep(5)
         log_path.write_text("\n".join(outputs), encoding="utf-8")
-        return gpu, False, str(log_path)
+        return slot, gpu, False, str(log_path)
 
     with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
-        results = list(executor.map(probe, gpus))
-    failed = [(gpu, log) for gpu, success, log in results if not success]
+        results = list(executor.map(probe, enumerate(gpus)))
+    failed = [
+        (slot, gpu, log) for slot, gpu, success, log in results if not success
+    ]
     if failed:
-        details = ", ".join(f"GPU {gpu}: {log}" for gpu, log in failed)
+        details = ", ".join(
+            f"slot {slot} GPU {gpu}: {log}" for slot, gpu, log in failed
+        )
         raise RuntimeError(f"concurrent headless rendering smoke test failed: {details}")
 
 
@@ -550,6 +557,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-name", default="demo_clean_depth_turbovla")
     parser.add_argument("--embodiment-dir", default="aloha_agilex")
     parser.add_argument("--gpus", help="comma-separated physical GPU indices or UUIDs")
+    parser.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        default=int(os.environ.get("ROBOTWIN_WORKERS_PER_GPU", "1")),
+        help="concurrent RoboTwin collection processes per physical GPU",
+    )
     parser.add_argument("--max-attempts", type=int, default=8)
     parser.add_argument("--attempt-timeout-hours", type=float, default=8.0)
     parser.add_argument("--stall-timeout-minutes", type=float, default=60.0)
@@ -572,7 +585,14 @@ def main() -> int:
     args.task_file = args.task_file.expanduser().resolve()
     args.config_template = args.config_template.expanduser().resolve()
     tasks = read_tasks(args.task_file)
-    gpus = parse_gpu_list(args.gpus)
+    physical_gpus = parse_gpu_list(args.gpus)
+    if args.workers_per_gpu < 1:
+        raise ValueError("--workers-per-gpu must be at least 1")
+    gpus = [
+        gpu
+        for gpu in physical_gpus
+        for _worker_index in range(args.workers_per_gpu)
+    ]
     collector_path, config_dir = resolve_robotwin_layout(args.robotwin_path)
 
     states = {
@@ -612,7 +632,9 @@ def main() -> int:
     )
     print(
         f"[INFO] tasks={len(tasks)}, episodes_per_task={args.episodes_per_task}, "
-        f"target={len(tasks) * args.episodes_per_task}, gpus={','.join(gpus)}",
+        f"target={len(tasks) * args.episodes_per_task}, "
+        f"physical_gpus={','.join(physical_gpus)}, "
+        f"workers_per_gpu={args.workers_per_gpu}, worker_slots={len(gpus)}",
         flush=True,
     )
     print(f"[INFO] output={args.output_root}", flush=True)

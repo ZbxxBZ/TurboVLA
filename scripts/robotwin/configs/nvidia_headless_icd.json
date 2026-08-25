@@ -1,0 +1,7 @@
+{
+  "file_format_version": "1.0.0",
+  "ICD": {
+    "library_path": "/root/nvidia-egl-580.76.05/libEGL_nvidia.so.0",
+    "api_version": "1.3.277"
+  }
+}

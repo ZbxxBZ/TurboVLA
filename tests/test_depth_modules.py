@@ -1,67 +1,119 @@
+from dataclasses import replace
+
 import pytest
 import torch
+from torch import nn
 
 from turbovla.models.configuration import DepthEncoderConfig, DepthFusionConfig, TurboVLAConfig, VisionEncoderConfig
-from turbovla.models.depth_encoder import MetricDepthEncoder
+from turbovla.models.depth_dinov3 import DepthHeadLite
+from turbovla.models.depth_encoder import DINOv3DepthEncoder
 from turbovla.models.depth_fusion import GatedAlignedDepthFusion, GatedDepthCrossAttention
 
 
-def test_metric_depth_encoder_shape_and_invalid_mask():
+class _DummyDepthBackbone(nn.Module):
+    def __init__(self, out_channels: int = 8) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(3, out_channels, kernel_size=16, stride=16)
+
+    def forward(self, images):
+        return self.projection(images)
+
+
+def _depth_encoder() -> DINOv3DepthEncoder:
     config = DepthEncoderConfig(
         enabled=True,
         image_size=32,
         num_views=3,
         hidden_dim=32,
         patch_size=16,
+        backbone_hidden_dim=8,
+        feature_dim=16,
+        freeze_backbone=True,
+        freeze_depth_head=True,
+        dropout=0.0,
     )
-    encoder = MetricDepthEncoder(config)
-    depth = torch.full((2, 3, 1, 32, 32), 1000, dtype=torch.uint16)
-    depth[0, 0, :, :16, :16] = 0
+    head = DepthHeadLite(in_ch=8, out_size=(32, 32), common_ch=16, dropout=0.0)
+    return DINOv3DepthEncoder(config, backbone=_DummyDepthBackbone(), depth_head=head)
 
-    tokens, invalid_mask = encoder(depth)
 
-    assert encoder.patch_embed.in_channels == 2
+def test_dinov3_depth_encoder_uses_only_cam_head_and_masks_wrist_views():
+    encoder = _depth_encoder().eval()
+    rgb = torch.randn(2, 3, 3, 32, 32)
+
+    tokens, invalid_mask = encoder(rgb)
+    changed_wrists = rgb.clone()
+    changed_wrists[:, 1:] = torch.randn_like(changed_wrists[:, 1:]) * 100
+    changed_tokens, changed_mask = encoder(changed_wrists)
+
     assert tokens.shape == (2, 3, 4, 32)
     assert invalid_mask.shape == (2, 3, 4)
-    # 第一个 patch 全是 0 毫米，应当从深度融合中屏蔽。
-    assert invalid_mask[0, 0, 0]
-    assert not invalid_mask[1].any()
+    assert not invalid_mask[:, 0].any()
+    assert invalid_mask[:, 1:].all()
+    assert torch.equal(tokens[:, 1:], torch.zeros_like(tokens[:, 1:]))
+    assert torch.equal(tokens, changed_tokens)
+    assert torch.equal(invalid_mask, changed_mask)
 
 
-def test_metric_depth_encoder_distinguishes_invalid_from_normalized_midpoint():
-    config = DepthEncoderConfig(
-        enabled=True,
-        image_size=32,
-        num_views=1,
-        hidden_dim=8,
-        patch_size=16,
-        invalid_threshold=0.5,
+def test_dinov3_depth_encoder_freezes_pretrained_geometry_but_trains_token_adapter():
+    encoder = _depth_encoder().train()
+
+    assert not encoder.backbone.training
+    assert not encoder.depth_head.training
+    assert not any(parameter.requires_grad for parameter in encoder.backbone.parameters())
+    assert not any(parameter.requires_grad for parameter in encoder.depth_head.parameters())
+    assert all(parameter.requires_grad for parameter in encoder.token_projection.parameters())
+    assert all(parameter.requires_grad for parameter in encoder.token_norm.parameters())
+
+
+def test_depth_head_exposes_fused_feature_and_positive_metric_depth():
+    head = DepthHeadLite(in_ch=8, out_size=(32, 32), common_ch=16, dropout=0.0).eval()
+    backbone_features = torch.randn(2, 8, 2, 2)
+
+    fused = head.forward_features(backbone_features)
+    depth = head.predict_from_features(fused)
+
+    assert fused.shape == (2, 16, 8, 8)
+    assert depth.shape == (2, 1, 32, 32)
+    assert torch.isfinite(depth).all()
+    assert (depth > 0).all()
+
+
+def test_stage_one_depth_prediction_accepts_cam_head_rgb_directly():
+    encoder = _depth_encoder().eval()
+    head_rgb = torch.randn(2, 3, 32, 32)
+
+    depth = encoder.predict_head_depth(head_rgb)
+
+    assert depth.shape == (2, 1, 32, 32)
+
+
+def test_projection_checkpoint_restores_stage_15_adapter(tmp_path):
+    source = _depth_encoder()
+    with torch.no_grad():
+        source.token_projection.weight.fill_(0.25)
+        source.token_projection.bias.fill_(-0.5)
+        source.token_norm.weight.fill_(1.5)
+        source.token_norm.bias.fill_(0.125)
+    checkpoint_path = tmp_path / "projection.pt"
+    torch.save(
+        {
+            "token_projection": source.token_projection.state_dict(),
+            "token_norm": source.token_norm.state_dict(),
+        },
+        checkpoint_path,
     )
-    encoder = MetricDepthEncoder(config)
-    captured_input = {}
 
-    def capture_patch_input(_module, args):
-        captured_input["value"] = args[0].detach().clone()
+    config = replace(source.config, projection_weights_path=str(checkpoint_path))
+    restored = DINOv3DepthEncoder(
+        config,
+        backbone=_DummyDepthBackbone(),
+        depth_head=DepthHeadLite(in_ch=8, out_size=(32, 32), common_ch=16, dropout=0.0),
+    )
 
-    handle = encoder.patch_embed.register_forward_pre_hook(capture_patch_input)
-    try:
-        # 0.5m 是当前 log 范围 [0.05m, 5m] 的归一化中点，深度通道中的值约为 0。
-        depth = torch.full((1, 1, 1, 32, 32), 500.0)
-        # 第一个 patch 仅 25% 无效，仍会作为 K/V 使用，因此必须保留逐像素有效性信息。
-        depth[:, :, :, :4, :16] = 0.0
-        _, invalid_mask = encoder(depth)
-    finally:
-        handle.remove()
-
-    encoder_input = captured_input["value"]
-    normalized_depth = encoder_input[:, 0]
-    validity = encoder_input[:, 1]
-
-    assert encoder_input.shape == (1, 2, 32, 32)
-    assert torch.allclose(normalized_depth, torch.zeros_like(normalized_depth), atol=1e-6)
-    assert torch.equal(validity[:, :4, :16], torch.zeros_like(validity[:, :4, :16]))
-    assert torch.equal(validity[:, 4:16, :16], torch.ones_like(validity[:, 4:16, :16]))
-    assert not invalid_mask[0, 0, 0]
+    assert torch.equal(restored.token_projection.weight, source.token_projection.weight)
+    assert torch.equal(restored.token_projection.bias, source.token_projection.bias)
+    assert torch.equal(restored.token_norm.weight, source.token_norm.weight)
+    assert torch.equal(restored.token_norm.bias, source.token_norm.bias)
 
 
 def test_zero_gate_preserves_rgb_and_all_invalid_depth_is_finite():
@@ -76,6 +128,34 @@ def test_zero_gate_preserves_rgb_and_all_invalid_depth_is_finite():
 
     assert torch.equal(fused, rgb_tokens)
     assert torch.isfinite(fused).all()
+
+
+def test_zero_initialized_cross_attention_starts_as_identity_and_tracks_residual_ratio():
+    fusion = GatedDepthCrossAttention(
+        DepthFusionConfig(
+            enabled=True,
+            hidden_dim=32,
+            nheads=4,
+            gate_init=0.15,
+            gate_parameterization="bounded_sigmoid",
+            gate_min=0.02,
+            gate_max=0.30,
+            zero_init_output=True,
+        )
+    )
+    rgb_tokens = torch.randn(2, 3, 4, 32)
+    depth_tokens = torch.randn_like(rgb_tokens)
+
+    initial = fusion(rgb_tokens, depth_tokens)
+    assert torch.equal(initial, rgb_tokens)
+    assert torch.equal(fusion.residual_ratio(), torch.zeros(6))
+
+    with torch.no_grad():
+        fusion.cross_attention.out_proj.weight.copy_(torch.eye(32))
+    updated = fusion(rgb_tokens, depth_tokens)
+    assert not torch.equal(updated, rgb_tokens)
+    assert fusion.residual_ratio().shape == (6,)
+    assert torch.all(fusion.residual_ratio() > 0)
 
 
 def test_aligned_fusion_only_changes_the_matching_token():

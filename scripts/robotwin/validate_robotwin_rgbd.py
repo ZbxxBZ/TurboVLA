@@ -128,18 +128,42 @@ def _check_camera_streams(
         depth_key = f"/{root}/{stored_camera}/{depth_field}"
         if rgb_key not in handle:
             raise KeyError(f"missing {rgb_key}")
-        if depth_key not in handle:
-            raise KeyError(f"missing {depth_key}")
 
         rgb = handle[rgb_key]
-        depth = handle[depth_key]
         lengths[rgb_key] = len(rgb)
-        lengths[depth_key] = len(depth)
         rgb_shape = _check_rgb_samples(rgb, rgb_key)
-        _check_depth(depth, depth_key, rgb_shape)
-        depth_dtypes[output_camera] = str(depth.dtype)
-        depth_shapes[output_camera] = list(depth.shape)
+        if output_camera == "head_camera":
+            if depth_key not in handle:
+                raise KeyError(f"missing {depth_key}")
+            depth = handle[depth_key]
+            lengths[depth_key] = len(depth)
+            _check_depth(depth, depth_key, rgb_shape)
+            depth_dtypes[output_camera] = str(depth.dtype)
+            depth_shapes[output_camera] = list(depth.shape)
+        elif depth_key in handle:
+            raise ValueError(f"wrist depth must not be stored: {depth_key}")
     return lengths, depth_dtypes, depth_shapes
+
+
+def _check_pointcloud(dataset: h5py.Dataset, key: str) -> int:
+    if dataset.ndim != 3 or dataset.shape[1:] != (1024, 6):
+        raise ValueError(f"{key} must be [T,1024,6], got {dataset.shape}")
+    if not np.issubdtype(dataset.dtype, np.number):
+        raise ValueError(f"{key} must be numeric, got {dataset.dtype}")
+    has_geometry = False
+    for start in range(0, len(dataset), 16):
+        values = np.asarray(dataset[start : start + 16])
+        if not np.isfinite(values).all():
+            raise ValueError(f"{key} contains NaN or Inf")
+        has_geometry = has_geometry or bool(
+            (np.linalg.norm(values[..., :3], axis=-1) > 1e-6).any()
+        )
+        colors = values[..., 3:]
+        if (colors < 0).any() or (colors > 1).any():
+            raise ValueError(f"{key} RGB values must be in [0,1]")
+    if not has_geometry:
+        raise ValueError(f"{key} contains no non-zero XYZ points")
+    return len(dataset)
 
 
 def _check_legacy_schema(
@@ -168,6 +192,8 @@ def _check_legacy_schema(
 def _check_xpolicylab_schema(
     handle: h5py.File,
 ) -> tuple[dict[str, int], dict[str, str], dict[str, list[int]]]:
+    if "/vision/cam_third_view" in handle:
+        raise ValueError("cam_third_view must not be stored; use cam_head")
     lengths, depth_dtypes, depth_shapes = _check_camera_streams(
         handle,
         XPOLICY_CAMERAS,
@@ -188,6 +214,12 @@ def _check_xpolicylab_schema(
             raise ValueError(
                 f"/{group_name} joint fields must total 14 Aloha values, got {total_width}"
             )
+    pointcloud_key = "/pointclouds"
+    if pointcloud_key not in handle:
+        raise KeyError(f"missing {pointcloud_key}")
+    lengths[pointcloud_key] = _check_pointcloud(
+        handle[pointcloud_key], pointcloud_key
+    )
     return lengths, depth_dtypes, depth_shapes
 
 
@@ -300,7 +332,7 @@ def _read_tasks(task_file: Path) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--config-name", default="demo_clean_depth")
+    parser.add_argument("--config-name", default="demo_clean_depth_turbovla")
     parser.add_argument("--target-episodes", type=int, default=10)
     parser.add_argument("--embodiment-dir", default="aloha_agilex")
     parser.add_argument("--task-file", type=Path)

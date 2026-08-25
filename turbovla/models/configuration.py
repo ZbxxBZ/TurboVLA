@@ -27,6 +27,7 @@ class VisionEncoderConfig:
     encode_views_separately: bool = True
     frozen: bool = False
     local_files_only: bool = True
+    load_pretrained_weights: bool = True
     attention_implementation: str | None = None
     compute_precision: str = "bf16_autocast"
     position_init_std: float = 0.01
@@ -36,23 +37,24 @@ class VisionEncoderConfig:
 
 @dataclass
 class DepthEncoderConfig:
-    """真实深度编码器的配置。
-
-    深度分支默认关闭，以便旧的 RGB-only 配置和 checkpoint 保持完全兼容。
-    RoboTwin 的原始深度单位是毫米，数据管线会保留这个数值，编码器在这里统一换算成米。
-    """
+    """DINOv3 RGB-to-depth token encoder configuration."""
 
     enabled: bool = False
     image_size: int = 224
     num_views: int = 3
     hidden_dim: int = 256
     patch_size: int = 16
-    input_unit: str = "millimeter"
-    depth_scale: float = 1000.0
-    min_depth_m: float = 0.05
-    max_depth_m: float = 5.0
-    use_log_depth: bool = True
-    invalid_threshold: float = 0.5
+    head_camera_index: int = 0
+    backbone_name: str = "dinov3_vits16plus"
+    backbone_repo_path: str = ""
+    backbone_weights_path: str = ""
+    backbone_num_layers: int = 12
+    backbone_hidden_dim: int = 384
+    head_weights_path: str = ""
+    projection_weights_path: str = ""
+    feature_dim: int = 160
+    freeze_backbone: bool = True
+    freeze_depth_head: bool = True
     frozen: bool = False
     dropout: float = 0.0
 
@@ -70,6 +72,7 @@ class DepthFusionConfig:
     gate_min: float = 0.0
     gate_max: float = 1.0
     mode: str = "global"
+    zero_init_output: bool = False
 
 
 @dataclass
@@ -139,15 +142,12 @@ class TurboVLAConfig:
             raise ValueError("depth.image_size and depth.patch_size must be positive")
         if self.depth.image_size % self.depth.patch_size != 0:
             raise ValueError("depth.image_size must be divisible by depth.patch_size")
-        if self.depth.input_unit not in {"millimeter", "meter"}:
-            raise ValueError("depth.input_unit must be 'millimeter' or 'meter'")
-        if self.depth.depth_scale <= 0:
-            raise ValueError("depth.depth_scale must be positive")
-        if self.depth.min_depth_m <= 0 or self.depth.max_depth_m <= self.depth.min_depth_m:
-            raise ValueError("depth min/max range is invalid")
-        # 阈值为 0 时所有 patch 都会满足 invalid_fraction >= 0，因此直接禁止该退化配置。
-        if not 0.0 < self.depth.invalid_threshold <= 1.0:
-            raise ValueError("depth.invalid_threshold must be in (0, 1]")
+        if not 0 <= self.depth.head_camera_index < self.depth.num_views:
+            raise ValueError("depth.head_camera_index must identify one configured RGB view")
+        if self.depth.backbone_num_layers < 1 or self.depth.backbone_hidden_dim < 1:
+            raise ValueError("depth DINOv3 backbone dimensions must be positive")
+        if self.depth.feature_dim < 1:
+            raise ValueError("depth.feature_dim must be positive")
         if self.depth_fusion.mode == "global" and self.depth_fusion.nheads < 1:
             raise ValueError("depth_fusion.nheads must be positive")
         if (

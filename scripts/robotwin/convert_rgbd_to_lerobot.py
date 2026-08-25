@@ -27,6 +27,7 @@ CAMERA_MAP = {
     "cam_left_wrist": "cam_left_wrist",
     "cam_right_wrist": "cam_right_wrist",
 }
+DEPTH_OUTPUT_CAMERA = "cam_high"
 JOINT_FIELDS = (
     "left_arm_joint_states",
     "left_ee_joint_states",
@@ -198,26 +199,26 @@ def _episode_frame_table(
         spatial_shape: tuple[int, int] | None = None
         for output_camera, stored_camera in CAMERA_MAP.items():
             rgb_key = f"/vision/{stored_camera}/colors"
-            depth_key = f"/vision/{stored_camera}/depths"
-            if rgb_key not in handle or depth_key not in handle:
-                raise KeyError(f"missing synchronized RGB-D pair {rgb_key}, {depth_key}")
+            if rgb_key not in handle:
+                raise KeyError(f"missing RGB stream {rgb_key}")
             rgb = handle[rgb_key]
-            depth = handle[depth_key]
-            if len(rgb) != frames or len(depth) != frames or depth.ndim != 3:
-                raise ValueError(
-                    f"stream length/shape mismatch in {path}: RGB={rgb.shape}, depth={depth.shape}"
-                )
-            current_shape = (int(depth.shape[1]), int(depth.shape[2]))
-            if spatial_shape is None:
-                spatial_shape = current_shape
-            elif current_shape != spatial_shape:
-                raise ValueError(f"camera resolutions differ in {path}")
+            if len(rgb) != frames:
+                raise ValueError(f"RGB stream length mismatch in {path}: {rgb.shape}")
             columns[f"observation.images.{output_camera}"] = [
                 _image_entry(_encoded_rgb(rgb[index])) for index in range(frames)
             ]
-            columns[f"observation.depths.{output_camera}"] = [
-                _image_entry(_depth_png(depth[index])) for index in range(frames)
-            ]
+
+            if output_camera == DEPTH_OUTPUT_CAMERA:
+                depth_key = f"/vision/{stored_camera}/depths"
+                if depth_key not in handle:
+                    raise KeyError(f"missing head-camera depth stream {depth_key}")
+                depth = handle[depth_key]
+                if len(depth) != frames or depth.ndim != 3:
+                    raise ValueError(f"head depth shape mismatch in {path}: {depth.shape}")
+                spatial_shape = (int(depth.shape[1]), int(depth.shape[2]))
+                columns[f"observation.depths.{output_camera}"] = [
+                    _image_entry(_depth_png(depth[index])) for index in range(frames)
+                ]
 
     assert spatial_shape is not None
     table = pd.DataFrame(columns)
@@ -256,8 +257,9 @@ def _modality_metadata() -> dict[str, Any]:
             for camera in CAMERA_MAP
         },
         "depth": {
-            camera: {"original_key": f"observation.depths.{camera}"}
-            for camera in CAMERA_MAP
+            DEPTH_OUTPUT_CAMERA: {
+                "original_key": f"observation.depths.{DEPTH_OUTPUT_CAMERA}"
+            }
         },
         "annotation": {
             "human.action.task_description": {"original_key": "task_index"}
@@ -299,13 +301,13 @@ def _info_metadata(
             "shape": [3, height, width],
             "names": ["channels", "height", "width"],
         }
-        features[f"observation.depths.{camera}"] = {
-            "dtype": "image",
-            "shape": [1, height, width],
-            "names": ["channel", "height", "width"],
-            "depth_dtype": "uint16",
-            "depth_unit": "millimeter",
-        }
+    features[f"observation.depths.{DEPTH_OUTPUT_CAMERA}"] = {
+        "dtype": "image",
+        "shape": [1, height, width],
+        "names": ["channel", "height", "width"],
+        "depth_dtype": "uint16",
+        "depth_unit": "millimeter",
+    }
     for key, dtype in (
         ("timestamp", "float32"),
         ("frame_index", "int64"),

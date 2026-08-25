@@ -1,4 +1,4 @@
-run_id: turbovla_robotwin_rgbd_arch18_200_depth_8ep
+run_id: turbovla_robotwin_clean50_360_depth_gate015_8ep
 run_root_dir: results/Checkpoints
 seed: 42
 wandb_entity: your_wandb_entity
@@ -14,30 +14,37 @@ framework:
     sub_sentence_present: true
     local_files_only: true
     freeze_text_encoder: true
-    attn_implementation: flash_attention_2
+    attn_implementation: sdpa
   vision:
     model_path: ${oc.env:DINOV3_MODEL_PATH}
     image_size: 224
     num_views: 3
     local_files_only: true
+    # The released TurboVLA checkpoint supplies every RGB DINOv3-L tensor.
+    load_pretrained_weights: false
     freeze_vision_encoder: true
-    attn_implementation: flash_attention_2
+    attn_implementation: sdpa
     position_init_std: 0.01
     position_scale_init: 0.01
     dropout: 0.1
   depth:
-    # RoboTwin 保存真实毫米深度；该分支不运行 Depth Anything，而是直接编码度量深度。
+    # Only cam_head RGB is encoded by the separately depth-supervised DINOv3 branch.
     enabled: true
     image_size: 224
     num_views: 3
     hidden_dim: 256
     patch_size: 16
-    input_unit: millimeter
-    depth_scale: 1000.0
-    min_depth_m: 0.05
-    max_depth_m: 5.0
-    use_log_depth: true
-    invalid_threshold: 0.5
+    head_camera_index: 0
+    backbone_name: dinov3_vits16plus
+    backbone_repo_path: ${oc.env:DEPTH_DINOV3_REPO_PATH}
+    backbone_weights_path: ${oc.env:DEPTH_DINOV3_BACKBONE_WEIGHTS}
+    backbone_num_layers: 12
+    backbone_hidden_dim: 384
+    head_weights_path: ${oc.env:DEPTH_DINOV3_HEAD_WEIGHTS}
+    projection_weights_path: ${oc.env:DEPTH_DINOV3_PROJECTION_WEIGHTS}
+    feature_dim: 160
+    freeze_backbone: true
+    freeze_depth_head: true
     freeze_depth_encoder: false
     dropout: 0.0
   depth_fusion:
@@ -49,10 +56,11 @@ framework:
     dropout: 0.0
     # Legacy checkpoints keep tanh semantics by default. This recipe uses a
     # positive bounded gate so the depth branch cannot collapse back to zero.
-    gate_init: 0.08
+    gate_init: 0.15
     gate_parameterization: bounded_sigmoid
     gate_min: 0.02
     gate_max: 0.30
+    zero_init_output: true
   interaction:
     hidden_dim: 256
     nheads: 8
@@ -89,9 +97,10 @@ datasets:
     dataset_py: lerobot_datasets
     include_state: true
     data_root_dir: ${oc.env:ROBOTWIN_DATA_ROOT}
-    data_mix: robotwin_rgbd_arch18_200
-    # 独立元数据只为深度实验使用，不覆盖原始 meta/modality.json。
-    modality_metadata_path: experiments/robotwin/configs/modality_depth.json
+    data_mix: robotwin_depthaware_clean50_360
+    # Policy training consumes RGB only. Metric cam_head depth is used solely
+    # by scripts/robotwin/train_depth_dinov3.py during stage one.
+    modality_metadata_path: experiments/robotwin/configs/modality.json
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false
@@ -105,24 +114,24 @@ datasets:
     pin_memory: true
 
 trainer:
-  use_deepspeed: true
-  max_train_steps: 20392
+  use_deepspeed: false
+  max_train_steps: 32760
   num_warmup_steps: 1000
-  save_interval: 2549
+  save_interval: 4095
   eval_interval: 1000
   learning_rate:
     base: 5.0e-05
     # 深度模块使用较大学习率；预训练交互层和完整动作头使用较小学习率适应深度特征。
-    depth_encoder: 1.0e-04
+    depth_encoder: 1.0e-05
     depth_fusion: 1.0e-04
     vision_language_interaction: 5.0e-06
     action_head: 1.0e-05
   lr_scheduler_type: warmup_constant_with_factor
   scheduler_specific_kwargs:
     warmup_start_factor: 0.0
-  # Only the two pretrained backbones stay frozen; every projection, position
-  # parameter, fusion layer, and action-head parameter remains trainable.
-  freeze_modules: vision_encoder.backbone, text_encoder.bert
+  # Freeze both DINO backbones, BERT, and the stage-one depth head. The new
+  # 160->256 adapter and policy-side fusion modules remain trainable.
+  freeze_modules: vision_encoder.backbone, text_encoder.bert, depth_encoder.backbone, depth_encoder.depth_head
   train_modules: ""
   max_grad_norm: 1.0
   gradient_clipping: 1.0
@@ -135,7 +144,8 @@ trainer:
   save_format: pt
   ema_decay: 0.999
   ema_device: cuda
-  depth_gate_warmup_steps: 0
-  depth_gate_warmup_start: 0.02
-  depth_gate_warmup_end: 0.08
+  # Keep a deliberately strong gate for epoch one, then release it without a jump.
+  depth_gate_warmup_steps: 4095
+  depth_gate_warmup_start: 0.15
+  depth_gate_warmup_end: 0.15
   logging_frequency: 50

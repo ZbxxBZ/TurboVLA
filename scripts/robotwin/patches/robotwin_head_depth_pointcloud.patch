@@ -1,0 +1,33 @@
+--- a/envs/utils/pkl2hdf5.py
++++ b/envs/utils/pkl2hdf5.py
+@@ -13,7 +13,6 @@ CAMERA_MAP = {
+     "head_camera": "cam_head",
+     "left_camera": "cam_left_wrist",
+     "right_camera": "cam_right_wrist",
+-    "front_camera": "cam_third_view",
+ }
+
+
+@@ -166,7 +166,7 @@ def create_xpolicylab_hdf5(data, hdf5_path, instructions, frequency):
+                 "shape", data=np.asarray(colors[0].shape, dtype=np.int32)
+             )
+ 
+-            if "depth" in source_camera:
++            if source_name == "head_camera" and "depth" in source_camera:
+                 target_camera.create_dataset(
+                     "depths", data=np.asarray(source_camera["depth"])[:-1]
+                 )
+@@ -188,5 +188,13 @@ def create_xpolicylab_hdf5(data, hdf5_path, instructions, frequency):
+                 target_camera.create_dataset(
+                     "extrinsics_matrix", data=_to_4x4(extrinsic)[:-1]
+                 )
++
++        pointclouds = np.asarray(data.get("pointcloud", []), dtype=np.float32)
++        if pointclouds.shape != (frame_num, 1024, 6):
++            raise ValueError(
++                "Expected head-camera pointclouds with shape "
++                f"({frame_num}, 1024, 6), got {pointclouds.shape}"
++            )
++        f.create_dataset("pointclouds", data=pointclouds[:-1])
+ 
+     return frame_num - 1

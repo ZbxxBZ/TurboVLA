@@ -19,6 +19,7 @@ logs/
 wandb/
 eval_result/
 results/
+artifacts/
 tmp/
 .eval_watch_state*/
 *.pt

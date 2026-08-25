@@ -12,6 +12,7 @@ class _DepthGateMixin:
 
     def _init_depth_gate(self, config: DepthFusionConfig) -> None:
         self._gate_override: float | None = None
+        self._last_residual_ratio: torch.Tensor | None = None
         if config.gate_parameterization == "bounded_sigmoid":
             ratio = (config.gate_init - config.gate_min) / (config.gate_max - config.gate_min)
             raw_init = torch.logit(torch.tensor(ratio, dtype=torch.float32)).item()
@@ -38,6 +39,21 @@ class _DepthGateMixin:
             width = self.config.gate_max - self.config.gate_min
             return self.config.gate_min + width * torch.sigmoid(self.depth_gate)
         return torch.tanh(self.depth_gate)
+
+    def residual_ratio(self) -> torch.Tensor | None:
+        """Return the latest per-view RMS(g * delta) / RMS(rgb) values."""
+        return self._last_residual_ratio
+
+    def _record_residual_ratio(
+        self,
+        rgb_tokens: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> None:
+        with torch.no_grad():
+            reduce_dims = tuple(range(2, rgb_tokens.ndim))
+            rgb_rms = rgb_tokens.detach().float().square().mean(dim=reduce_dims).sqrt()
+            residual_rms = residual.detach().float().square().mean(dim=reduce_dims).sqrt()
+            self._last_residual_ratio = (residual_rms / rgb_rms.clamp_min(1e-6)).flatten()
 
 
 class GatedAlignedDepthFusion(_DepthGateMixin, nn.Module):
@@ -85,7 +101,9 @@ class GatedAlignedDepthFusion(_DepthGateMixin, nn.Module):
             local_delta = local_delta.masked_fill(invalid_mask[..., None], 0.0)
 
         gate = self.effective_gate().to(device=local_delta.device, dtype=local_delta.dtype)
-        return rgb_tokens + gate.view(1, 1, 1, -1) * local_delta
+        residual = gate.view(1, 1, 1, -1) * local_delta
+        self._record_residual_ratio(rgb_tokens, residual)
+        return rgb_tokens + residual
 
 
 # rgb_tokens:         [B, V, N, D]
@@ -105,6 +123,10 @@ class GatedDepthCrossAttention(_DepthGateMixin, nn.Module):
             dropout=config.dropout,
             batch_first=True,
         )
+        if config.zero_init_output:
+            nn.init.zeros_(self.cross_attention.out_proj.weight)
+            if self.cross_attention.out_proj.bias is not None:
+                nn.init.zeros_(self.cross_attention.out_proj.bias)
         self.delta_dropout = nn.Dropout(config.dropout)
 
         # 门控参数
@@ -187,5 +209,10 @@ class GatedDepthCrossAttention(_DepthGateMixin, nn.Module):
 
         # tanh 限制深度修正幅度；gate=0 时结果逐元素严格等于原 RGB token。
         gate = self.effective_gate().to(device=delta.device, dtype=delta.dtype)
-        fused = flat_rgb + gate.view(1, 1, -1) * delta
+        residual = gate.view(1, 1, -1) * delta
+        self._record_residual_ratio(
+            flat_rgb.view(batch_size, num_views, num_tokens, hidden_dim),
+            residual.view(batch_size, num_views, num_tokens, hidden_dim),
+        )
+        fused = flat_rgb + residual
         return fused.view(batch_size, num_views, num_tokens, hidden_dim) # [B×V,N,D] -> [B,V,N,D]

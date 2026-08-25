@@ -45,6 +45,7 @@ class TurboVLADefaultConfig:
             "image_size": 224,
             "num_views": 3,
             "local_files_only": True,
+            "load_pretrained_weights": True,
             "freeze_vision_encoder": False,
             "attn_implementation": "flash_attention_2",
             "position_init_std": 0.01,
@@ -59,12 +60,17 @@ class TurboVLADefaultConfig:
             "num_views": 3,
             "hidden_dim": 256,
             "patch_size": 16,
-            "input_unit": "millimeter",
-            "depth_scale": 1000.0,
-            "min_depth_m": 0.05,
-            "max_depth_m": 5.0,
-            "use_log_depth": True,
-            "invalid_threshold": 0.5,
+            "head_camera_index": 0,
+            "backbone_name": "dinov3_vits16plus",
+            "backbone_repo_path": "",
+            "backbone_weights_path": "",
+            "backbone_num_layers": 12,
+            "backbone_hidden_dim": 384,
+            "head_weights_path": "",
+            "projection_weights_path": "",
+            "feature_dim": 160,
+            "freeze_backbone": True,
+            "freeze_depth_head": True,
             "freeze_depth_encoder": False,
             "dropout": 0.0,
         }
@@ -80,6 +86,7 @@ class TurboVLADefaultConfig:
             "gate_parameterization": "tanh",
             "gate_min": 0.0,
             "gate_max": 1.0,
+            "zero_init_output": False,
         }
     )
     interaction: dict = field(
@@ -168,6 +175,7 @@ class TurboVLAFramework(baseframework):
                 encode_views_separately=False,
                 frozen=bool(fw.vision.freeze_vision_encoder),
                 local_files_only=bool(fw.vision.local_files_only),
+                load_pretrained_weights=bool(fw.vision.load_pretrained_weights),
                 attention_implementation=fw.vision.get("attn_implementation"),
                 compute_precision="bf16_autocast",
                 position_init_std=float(fw.vision.position_init_std),
@@ -180,12 +188,17 @@ class TurboVLAFramework(baseframework):
                 num_views=int(fw.depth.num_views),
                 hidden_dim=int(fw.depth.hidden_dim),
                 patch_size=int(fw.depth.patch_size),
-                input_unit=str(fw.depth.input_unit),
-                depth_scale=float(fw.depth.depth_scale),
-                min_depth_m=float(fw.depth.min_depth_m),
-                max_depth_m=float(fw.depth.max_depth_m),
-                use_log_depth=bool(fw.depth.use_log_depth),
-                invalid_threshold=float(fw.depth.invalid_threshold),
+                head_camera_index=int(fw.depth.head_camera_index),
+                backbone_name=str(fw.depth.backbone_name),
+                backbone_repo_path=str(fw.depth.backbone_repo_path),
+                backbone_weights_path=str(fw.depth.backbone_weights_path),
+                backbone_num_layers=int(fw.depth.backbone_num_layers),
+                backbone_hidden_dim=int(fw.depth.backbone_hidden_dim),
+                head_weights_path=str(fw.depth.head_weights_path),
+                projection_weights_path=str(fw.depth.projection_weights_path),
+                feature_dim=int(fw.depth.feature_dim),
+                freeze_backbone=bool(fw.depth.freeze_backbone),
+                freeze_depth_head=bool(fw.depth.freeze_depth_head),
                 frozen=bool(fw.depth.freeze_depth_encoder),
                 dropout=float(fw.depth.dropout),
             ),
@@ -199,6 +212,7 @@ class TurboVLAFramework(baseframework):
                 gate_parameterization=str(fw.depth_fusion.gate_parameterization),
                 gate_min=float(fw.depth_fusion.gate_min),
                 gate_max=float(fw.depth_fusion.gate_max),
+                zero_init_output=bool(fw.depth_fusion.zero_init_output),
             ),
             interaction=InteractionConfig(
                 hidden_dim=int(fw.interaction.hidden_dim),
@@ -377,48 +391,6 @@ class TurboVLAFramework(baseframework):
             views.extend([views[-1]] * (num_views - len(views)))
         return views[:num_views]
 
-    @staticmethod
-    def _as_depth_view_list(depths, num_views: int) -> list[np.ndarray]:
-        # 深度保持数值数组，禁止转成 PIL/RGB，避免毫米精度被压缩到 8 bit。
-        if isinstance(depths, (list, tuple)):
-            views = list(depths)
-        else:
-            if isinstance(depths, torch.Tensor):
-                array = depths.detach().cpu().numpy()
-            else:
-                array = np.asarray(depths)
-            if array.ndim == 2 or (array.ndim == 3 and array.shape[-1] == 1):
-                views = [array]
-            else:
-                views = [array[index] for index in range(array.shape[0])]
-        if not views:
-            raise ValueError("each depth example must contain at least one view")
-        # RGB-D 模式要求三路相机严格一一对应，缺失时不能复制最后一路来掩盖数据错误。
-        if len(views) != num_views:
-            raise ValueError(f"expected exactly {num_views} depth views, got {len(views)}")
-
-        normalized_views = []
-        for view in views[:num_views]:
-            array = view.detach().cpu().numpy() if isinstance(view, torch.Tensor) else np.asarray(view)
-            if array.ndim == 3 and array.shape[-1] == 1:
-                array = array[..., 0]
-            if array.ndim == 3 and array.shape[0] == 1:
-                array = array[0]
-            if array.ndim != 2:
-                raise ValueError(f"each depth view must be [H,W], got {array.shape}")
-            normalized_views.append(array)
-        return normalized_views
-
-    def _prepare_depth_batch(self, examples: List[dict], device: torch.device) -> torch.Tensor:
-        depth_views = [self._as_depth_view_list(example["depth"], self.num_views) for example in examples]
-        depth = torch.as_tensor(np.stack(depth_views), device=device, dtype=torch.float32).unsqueeze(2)
-        if depth.shape[-2:] != (self.image_size, self.image_size):
-            flat_depth = depth.flatten(0, 1)
-            # 最近邻 resize 保留物体边界和 0 值无效区域，不制造虚假的中间深度。
-            flat_depth = F.interpolate(flat_depth, size=(self.image_size, self.image_size), mode="nearest")
-            depth = flat_depth.view(len(examples), self.num_views, 1, self.image_size, self.image_size)
-        return depth
-
     def _model_inputs(self, examples: List[dict]):
         if not isinstance(examples, list):
             examples = [examples]
@@ -441,11 +413,6 @@ class TurboVLAFramework(baseframework):
             dtype=torch.float32,
         )
         samples = {"dinov3": pixel_values}
-        if self.model.config.depth.enabled:
-            missing_depth = [index for index, example in enumerate(examples) if "depth" not in example]
-            if missing_depth:
-                raise ValueError(f"depth-enabled checkpoint requires depth in examples {missing_depth}")
-            samples["depth"] = self._prepare_depth_batch(examples, device)
         return instructions, samples, states
 
     def forward(self, examples: List[dict] = None, **kwargs):

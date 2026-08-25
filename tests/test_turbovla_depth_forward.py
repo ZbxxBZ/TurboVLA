@@ -42,6 +42,36 @@ class _DummyTextEncoder(nn.Module):
         return tokens, padding_mask, None
 
 
+class _DummyDepthEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_patches = (config.image_size // config.patch_size) ** 2
+        self.projection = nn.Linear(3, config.hidden_dim)
+
+    def forward(self, pixel_values):
+        if pixel_values.shape[1] != self.config.num_views:
+            raise ValueError(f"expected {self.config.num_views} RGB views, got {pixel_values.shape[1]}")
+        head = pixel_values[:, self.config.head_camera_index].mean(dim=(-2, -1))
+        head = self.projection(head).unsqueeze(1).expand(-1, self.num_patches, -1)
+        tokens = torch.zeros(
+            pixel_values.shape[0],
+            self.config.num_views,
+            self.num_patches,
+            self.config.hidden_dim,
+            device=pixel_values.device,
+        )
+        tokens[:, self.config.head_camera_index] = head
+        mask = torch.ones(tokens.shape[:-1], dtype=torch.bool, device=tokens.device)
+        mask[:, self.config.head_camera_index] = False
+        return tokens, mask
+
+
+@pytest.fixture(autouse=True)
+def patch_depth_encoder(monkeypatch):
+    monkeypatch.setattr(turbovla_module, "DINOv3DepthEncoder", _DummyDepthEncoder)
+
+
 @pytest.mark.parametrize(
     ("fusion_mode", "expected_fusion_type"),
     [
@@ -100,7 +130,6 @@ def test_turbovla_depth_forward_shape(monkeypatch, fusion_mode, expected_fusion_
     assert isinstance(model.depth_fusion, expected_fusion_type)
     samples = {
         "dinov3": torch.randn(2, 3, 3, 32, 32),
-        "depth": torch.full((2, 3, 1, 32, 32), 1000.0),
     }
 
     interaction_output = {}
@@ -129,7 +158,7 @@ def test_turbovla_depth_forward_shape(monkeypatch, fusion_mode, expected_fusion_
     )
 
 
-def test_turbovla_rejects_missing_depth_view(monkeypatch):
+def test_turbovla_rejects_missing_rgb_view_for_depth_encoder(monkeypatch):
     monkeypatch.setattr(turbovla_module, "DINOv3VisionEncoder", _DummyVisionEncoder)
     monkeypatch.setattr(turbovla_module, "TurboVLATextEncoder", _DummyTextEncoder)
     config = TurboVLAConfig(
@@ -154,11 +183,10 @@ def test_turbovla_rejects_missing_depth_view(monkeypatch):
     )
     model = turbovla_module.TurboVLA(config)
     samples = {
-        "dinov3": torch.randn(1, 3, 3, 32, 32),
-        "depth": torch.ones(1, 2, 1, 32, 32),
+        "dinov3": torch.randn(1, 2, 3, 32, 32),
     }
 
-    with pytest.raises(ValueError, match="expected 3 depth views"):
+    with pytest.raises(ValueError, match="expected 3 RGB views"):
         model(["pick up"], samples, torch.zeros(1, 14))
 
 
@@ -222,7 +250,6 @@ def test_rgb_checkpoint_preserves_full_model_output_with_zero_depth_gate(monkeyp
 
     samples = {
         "dinov3": torch.randn(1, 3, 3, 32, 32),
-        "depth": torch.full((1, 3, 1, 32, 32), 1000.0),
     }
     state = torch.zeros(1, 14)
     with torch.no_grad():

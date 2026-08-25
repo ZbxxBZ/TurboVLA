@@ -81,12 +81,23 @@ class EMAVLATrainer(base_train.VLATrainer):
         if fusion is None or not callable(getattr(fusion, "effective_gate", None)):
             return {}
         gate = fusion.effective_gate().detach().float()
-        return {
+        metrics = {
             "depth_gate_mean": gate.mean().item(),
             "depth_gate_abs_mean": gate.abs().mean().item(),
             "depth_gate_min": gate.min().item(),
             "depth_gate_max": gate.max().item(),
         }
+        residual_ratio = fusion.residual_ratio()
+        if residual_ratio is not None and residual_ratio.numel() > 0:
+            residual_ratio = residual_ratio.detach().float()
+            metrics.update(
+                {
+                    "depth_residual_ratio_mean": residual_ratio.mean().item(),
+                    "depth_residual_ratio_p50": torch.quantile(residual_ratio, 0.50).item(),
+                    "depth_residual_ratio_p95": torch.quantile(residual_ratio, 0.95).item(),
+                }
+            )
+        return metrics
 
     def _init_ema(self):
         self.ema_decay = float(getattr(self.config.trainer, "ema_decay", 0.0) or 0.0)

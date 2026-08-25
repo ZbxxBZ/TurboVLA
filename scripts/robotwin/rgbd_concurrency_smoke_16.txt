@@ -1,0 +1,17 @@
+# One successful trajectory per task for the single-GPU 16-worker smoke test.
+click_alarmclock
+click_bell
+move_pillbottle_pad
+place_phone_stand
+stack_blocks_three
+stamp_seal
+turn_switch
+open_microwave
+adjust_bottle
+blocks_ranking_rgb
+beat_block_hammer
+blocks_ranking_size
+grab_roller
+handover_block
+hanging_mug
+lift_pot

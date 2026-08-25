@@ -22,9 +22,10 @@ camera:
   collect_wrist_camera: true
 data_type:
   rgb: true
+  # RoboTwin's head camera is the fixed third-person observation used here.
   third_view: false
   depth: true
-  pointcloud: false
+  pointcloud: true
   observer: false
   endpose: true
   qpos: true

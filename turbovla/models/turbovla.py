@@ -19,7 +19,7 @@ from .configuration import (
     TurboVLAConfig,
     VisionEncoderConfig,
 )
-from .depth_encoder import MetricDepthEncoder
+from .depth_encoder import DINOv3DepthEncoder
 from .depth_fusion import GatedAlignedDepthFusion, GatedDepthCrossAttention
 from .text_encoder import TurboVLATextEncoder
 from .vision_encoder import DINOv3VisionEncoder
@@ -116,7 +116,7 @@ class TurboVLA(nn.Module):
             dropout=config.vision.dropout,
         )
 
-        self.depth_encoder: MetricDepthEncoder | None = None
+        self.depth_encoder: DINOv3DepthEncoder | None = None
         self.depth_fusion: GatedAlignedDepthFusion | GatedDepthCrossAttention | None = None
         if config.depth.enabled:
             if config.depth.patch_size != self.vision_encoder.patch_size:
@@ -126,7 +126,7 @@ class TurboVLA(nn.Module):
             if config.depth.image_size != config.vision.image_size:
                 raise ValueError("depth.image_size must match vision.image_size")
             # 深度分支只在显式启用的配方中创建；RGB-only 模型的参数名和行为保持不变。
-            self.depth_encoder = MetricDepthEncoder(config.depth)
+            self.depth_encoder = DINOv3DepthEncoder(config.depth)
             if config.depth_fusion.mode == "aligned":
                 self.depth_fusion = GatedAlignedDepthFusion(config.depth_fusion)
             else:
@@ -166,28 +166,9 @@ class TurboVLA(nn.Module):
             pixel_values = pixel_values[:, -1]
         if pixel_values.ndim != 5:
             raise ValueError(f"samples must be [B,V,3,H,W] or [B,T,V,3,H,W], got {tuple(pixel_values.shape)}")
+        if pixel_values.shape[1] != self.num_views:
+            raise ValueError(f"expected {self.num_views} RGB views, got {pixel_values.shape[1]}")
         return pixel_values
-
-    def _normalize_depth_samples(self, samples: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
-        if not isinstance(samples, Mapping) or "depth" not in samples:
-            raise ValueError("depth-enabled TurboVLA requires samples mapping to contain 'depth'")
-        depth_values = samples["depth"]
-        if depth_values.ndim == 6:
-            # 与 RGB 历史帧规则一致，只使用当前时刻的三视角真实深度。
-            depth_values = depth_values[:, -1]
-        elif depth_values.ndim == 5 and depth_values.shape[2] == self.num_views:
-            # 兼容省略通道维的历史深度 [B,T,V,H,W]。
-            depth_values = depth_values[:, -1].unsqueeze(2)
-        if depth_values.ndim == 4:
-            depth_values = depth_values.unsqueeze(2)
-        if depth_values.ndim != 5 or depth_values.shape[2] != 1:
-            raise ValueError(
-                "depth must be [B,V,1,H,W], [B,V,H,W], [B,T,V,1,H,W], "
-                f"or [B,T,V,H,W], got {tuple(depth_values.shape)}"
-            )
-        if depth_values.shape[1] != self.num_views:
-            raise ValueError(f"expected {self.num_views} depth views, got {depth_values.shape[1]}")
-        return depth_values
 
     def _position_visual_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         if self.config.vision.position_embedding == "learned_patch":
@@ -215,7 +196,7 @@ class TurboVLA(nn.Module):
 
     def encode_depth(
         self,
-        depth_values: torch.Tensor,
+        pixel_values: torch.Tensor,
         *,
         device: torch.device,
         dtype: torch.dtype,
@@ -223,7 +204,7 @@ class TurboVLA(nn.Module):
         if self.depth_encoder is None:
             raise RuntimeError("encode_depth requires the depth branch to be enabled")
 
-        depth_tokens, depth_invalid_mask = self.depth_encoder(depth_values.to(device))
+        depth_tokens, depth_invalid_mask = self.depth_encoder(pixel_values.to(device))
         depth_tokens = depth_tokens.to(device=device, dtype=dtype)
         if self.config.depth_fusion.mode == "global":
             depth_tokens = self._position_visual_tokens(depth_tokens)
@@ -235,7 +216,6 @@ class TurboVLA(nn.Module):
         samples: torch.Tensor | Mapping[str, torch.Tensor],
     ) -> torch.Tensor:
         pixel_values = self._normalize_samples(samples)
-        depth_values = self._normalize_depth_samples(samples) if self.config.depth.enabled else None
         device = pixel_values.device
         precision_context = nullcontext()
         if self.config.interaction.compute_precision == "bf16_autocast" and device.type == "cuda":
@@ -247,8 +227,6 @@ class TurboVLA(nn.Module):
             )
             if text_tokens.shape[0] != pixel_values.shape[0]:
                 raise ValueError("instruction batch size does not match image batch size")
-            if depth_values is not None and depth_values.shape[0] != pixel_values.shape[0]:
-                raise ValueError("depth batch size does not match image batch size")
             visual_tokens = self.encode_vision(pixel_values)
             visual_tokens, text_tokens = self.vision_language_interaction(
                 visual_tokens=visual_tokens,
@@ -258,11 +236,11 @@ class TurboVLA(nn.Module):
             )
 
             # The depth query must already carry task-language context.
-            if depth_values is not None:
+            if self.config.depth.enabled:
                 if self.depth_fusion is None:
                     raise RuntimeError("depth fusion is missing while the depth branch is enabled")
                 depth_tokens, depth_invalid_mask = self.encode_depth(
-                    depth_values,
+                    pixel_values,
                     device=visual_tokens.device,
                     dtype=visual_tokens.dtype,
                 )
@@ -363,12 +341,17 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 num_views=int(_arg(args, "num_views", 2)),
                 hidden_dim=int(_arg(args, "hidden_dim", 256)),
                 patch_size=int(_arg(args, "depth_patch_size", 16)),
-                input_unit=str(_arg(args, "depth_input_unit", "millimeter")),
-                depth_scale=float(_arg(args, "depth_scale", 1000.0)),
-                min_depth_m=float(_arg(args, "min_depth_m", 0.05)),
-                max_depth_m=float(_arg(args, "max_depth_m", 5.0)),
-                use_log_depth=bool(_arg(args, "use_log_depth", True)),
-                invalid_threshold=float(_arg(args, "depth_invalid_threshold", 0.5)),
+                head_camera_index=int(_arg(args, "depth_head_camera_index", 0)),
+                backbone_name=str(_arg(args, "depth_backbone_name", "dinov3_vits16plus")),
+                backbone_repo_path=str(_arg(args, "depth_backbone_repo_path", "")),
+                backbone_weights_path=str(_arg(args, "depth_backbone_weights_path", "")),
+                backbone_num_layers=int(_arg(args, "depth_backbone_num_layers", 12)),
+                backbone_hidden_dim=int(_arg(args, "depth_backbone_hidden_dim", 384)),
+                head_weights_path=str(_arg(args, "depth_head_weights_path", "")),
+                projection_weights_path=str(_arg(args, "depth_projection_weights_path", "")),
+                feature_dim=int(_arg(args, "depth_feature_dim", 160)),
+                freeze_backbone=bool(_arg(args, "freeze_depth_backbone", True)),
+                freeze_depth_head=bool(_arg(args, "freeze_depth_head", True)),
                 frozen=bool(_arg(args, "freeze_depth_encoder", False)),
                 dropout=float(_arg(args, "depth_dropout", 0.0)),
             ),

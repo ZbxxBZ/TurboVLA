@@ -24,8 +24,9 @@ if [[ -z "${ROBOTWIN_PYTHON:-}" ]]; then
     done
 fi
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-python}"
-ROBOTWIN_RGBD_ROOT="${ROBOTWIN_RGBD_ROOT:-/root/robotwin_rgbd_raw}"
+ROBOTWIN_RGBD_ROOT="${ROBOTWIN_RGBD_ROOT:-/root/dataset}"
 ROBOTWIN_COLLECTION_GPUS="${ROBOTWIN_COLLECTION_GPUS:-}"
+ROBOTWIN_WORKERS_PER_GPU="${ROBOTWIN_WORKERS_PER_GPU:-1}"
 EPISODES_PER_TASK="${EPISODES_PER_TASK:-10}"
 TASK_FILE="${ROBOTWIN_RGBD_TASK_FILE:-${SCRIPT_DIR}/rgbd_tasks_10.txt}"
 CONFIG_TEMPLATE="${ROBOTWIN_RGBD_CONFIG_TEMPLATE:-${SCRIPT_DIR}/configs/demo_clean_depth.yml}"
@@ -46,6 +47,7 @@ Environment overrides:
   ROBOTWIN_PYTHON               Python from the RoboTwin conda environment
   ROBOTWIN_RGBD_ROOT            Raw output directory outside /mnt
   ROBOTWIN_COLLECTION_GPUS      Comma-separated GPU IDs (default: auto-detect)
+  ROBOTWIN_WORKERS_PER_GPU      Concurrent processes per physical GPU (default: 1)
   EPISODES_PER_TASK             Successful episodes per task (default: 10)
   ROBOTWIN_RGBD_TMUX_SESSION    tmux session name
   ROBOTWIN_RGBD_EXTRA_ARGS      Extra collect_robotwin_rgbd.py arguments
@@ -71,6 +73,7 @@ show_status() {
         --output-root "${ROBOTWIN_RGBD_ROOT}"
         --task-file "${TASK_FILE}"
         --episodes-per-task "${EPISODES_PER_TASK}"
+        --workers-per-gpu "${ROBOTWIN_WORKERS_PER_GPU}"
         --status-only
     )
     if [[ -n "${ROBOTWIN_COLLECTION_GPUS}" ]]; then
@@ -118,6 +121,7 @@ case "${action}" in
             --task-file "${TASK_FILE}"
             --config-template "${CONFIG_TEMPLATE}"
             --episodes-per-task "${EPISODES_PER_TASK}"
+            --workers-per-gpu "${ROBOTWIN_WORKERS_PER_GPU}"
         )
         if [[ -n "${ROBOTWIN_COLLECTION_GPUS}" ]]; then
             command+=(--gpus "${ROBOTWIN_COLLECTION_GPUS}")

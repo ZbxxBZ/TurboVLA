@@ -32,12 +32,16 @@ def _write_episode(path: Path) -> tuple[np.ndarray, np.ndarray]:
             group = vision.create_group(camera)
             encoded = _jpeg_bytes((20 + camera_index, 40, 60))
             group.create_dataset("colors", data=[encoded] * frames, dtype=f"S{len(encoded)}")
-            group.create_dataset(
-                "depths",
-                data=np.stack(
-                    [np.full((6, 8), 500 + frame * 100, dtype=np.float32) for frame in range(frames)]
-                ),
-            )
+            if camera == "cam_head":
+                group.create_dataset(
+                    "depths",
+                    data=np.stack(
+                        [
+                            np.full((6, 8), 500 + frame * 100, dtype=np.float32)
+                            for frame in range(frames)
+                        ]
+                    ),
+                )
         for group_name, vector in (("state", state), ("action", action)):
             group = handle.create_group(group_name)
             group.create_dataset("left_arm_joint_states", data=vector[:, :6])
@@ -79,6 +83,8 @@ def test_convert_xpolicylab_rgbd_episode_to_lerobot(tmp_path: Path) -> None:
         parquet["observation.depths.cam_high"].iloc[2], output_task
     )
     np.testing.assert_array_equal(depth, np.full((6, 8), 700, dtype=np.uint16))
+    assert "observation.depths.cam_left_wrist" not in parquet
+    assert "observation.depths.cam_right_wrist" not in parquet
 
     with (output_task / "meta" / "info.json").open(encoding="utf-8") as handle:
         info = json.load(handle)
@@ -90,6 +96,8 @@ def test_convert_xpolicylab_rgbd_episode_to_lerobot(tmp_path: Path) -> None:
     assert info["total_videos"] == 0
     assert info["fps"] == 15
     assert info["features"]["observation.depths.cam_high"]["depth_unit"] == "millimeter"
+    assert "observation.depths.cam_left_wrist" not in info["features"]
+    assert "observation.depths.cam_right_wrist" not in info["features"]
     assert task == {"task_index": 0, "task": "first instruction"}
     assert stats["__cache_config"] == {"mode": "abs"}
     np.testing.assert_allclose(stats["statistics"]["action"]["mean"], expected_action.mean(0))

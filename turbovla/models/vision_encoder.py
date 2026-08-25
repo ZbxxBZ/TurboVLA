@@ -4,7 +4,7 @@ from contextlib import nullcontext
 
 import torch
 from torch import nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 from .configuration import VisionEncoderConfig
 
@@ -14,6 +14,11 @@ def _load_pretrained_model(config: VisionEncoderConfig):
         "local_files_only": config.local_files_only,
         "trust_remote_code": False,
     }
+    if not config.load_pretrained_weights:
+        model_config = AutoConfig.from_pretrained(config.model_name_or_path, **kwargs)
+        if config.attention_implementation:
+            model_config._attn_implementation = config.attention_implementation
+        return AutoModel.from_config(model_config, trust_remote_code=False)
     if config.attention_implementation:
         try:
             return AutoModel.from_pretrained(

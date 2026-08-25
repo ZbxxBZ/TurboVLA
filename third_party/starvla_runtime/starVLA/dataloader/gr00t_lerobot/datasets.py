@@ -1456,7 +1456,7 @@ class LeRobotSingleDataset(Dataset):
         }
 
         if "depth" in self.modality_keys:
-            # 保留 uint16/float 毫米值，真正的归一化只在模型的 MetricDepthEncoder 内执行。
+            # Keep metric depth unchanged for offline supervision of the RGB depth branch.
             sample["depth"] = [np.asarray(data[key][0]) for key in self.modality_keys["depth"]]
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:

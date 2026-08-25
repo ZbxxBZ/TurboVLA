@@ -39,7 +39,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets"):
         dataloader_kwargs["persistent_workers"] = persistent_workers
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
 
-    if dist.get_rank() == 0:
+    is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+    if is_main_process:
         logger.info(
             "VLA DataLoader config: "
             f"num_workers={num_workers}, pin_memory={pin_memory}, "
@@ -48,7 +49,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets"):
         )
 
     vla_train_dataloader = DataLoader(vla_dataset, **dataloader_kwargs)
-    if dist.get_rank() == 0:
+    if is_main_process:
         output_dir = Path(cfg.output_dir)
         vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
     return vla_train_dataloader
