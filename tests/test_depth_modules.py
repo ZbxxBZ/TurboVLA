@@ -8,6 +8,7 @@ from turbovla.models.configuration import DepthEncoderConfig, DepthFusionConfig,
 from turbovla.models.depth_dinov3 import DepthHeadLite
 from turbovla.models.depth_encoder import DINOv3DepthEncoder
 from turbovla.models.depth_fusion import GatedAlignedDepthFusion, GatedDepthCrossAttention
+from turbovla.models.vggt_depth_encoder import VGGTDepthEncoder
 
 
 class _DummyDepthBackbone(nn.Module):
@@ -17,6 +18,14 @@ class _DummyDepthBackbone(nn.Module):
 
     def forward(self, images):
         return self.projection(images)
+
+
+class _DummyVGGT(nn.Module):
+    def forward(self, images):
+        batch, frames, _, height, width = images.shape
+        depth = torch.ones(batch, frames, height, width, 1, device=images.device)
+        confidence = torch.ones(batch, frames, height, width, device=images.device)
+        return {"depth": depth, "depth_conf": confidence}
 
 
 def _depth_encoder() -> DINOv3DepthEncoder:
@@ -34,6 +43,42 @@ def _depth_encoder() -> DINOv3DepthEncoder:
     )
     head = DepthHeadLite(in_ch=8, out_size=(32, 32), common_ch=16, dropout=0.0)
     return DINOv3DepthEncoder(config, backbone=_DummyDepthBackbone(), depth_head=head)
+
+
+def _vggt_depth_encoder() -> VGGTDepthEncoder:
+    config = DepthEncoderConfig(
+        enabled=True,
+        backend="vggt",
+        image_size=32,
+        num_views=3,
+        hidden_dim=32,
+        patch_size=16,
+        feature_dim=16,
+        vggt_image_size=32,
+        freeze_backbone=True,
+        min_valid_fraction=0.5,
+    )
+    return VGGTDepthEncoder(config, vggt=_DummyVGGT())
+
+
+def test_vggt_depth_encoder_uses_only_cam_head_and_returns_policy_tokens():
+    encoder = _vggt_depth_encoder().eval()
+    rgb = torch.randn(2, 3, 3, 32, 32)
+    tokens, invalid_mask = encoder(rgb)
+
+    assert tokens.shape == (2, 3, 4, 32)
+    assert invalid_mask.shape == (2, 3, 4)
+    assert not invalid_mask[:, 0].any()
+    assert invalid_mask[:, 1:].all()
+    assert torch.isfinite(tokens).all()
+
+
+def test_vggt_depth_encoder_freezes_geometry_and_trains_adapter():
+    encoder = _vggt_depth_encoder().train()
+    assert not encoder.vggt.training
+    assert not any(parameter.requires_grad for parameter in encoder.vggt.parameters())
+    assert any(parameter.requires_grad for parameter in encoder.depth_patch_embedding.parameters())
+    assert any(parameter.requires_grad for parameter in encoder.token_projection.parameters())
 
 
 def test_dinov3_depth_encoder_uses_only_cam_head_and_masks_wrist_views():

@@ -51,6 +51,11 @@ robotwin = [
   "wandb",
   "websockets==15.0.1",
 ]
+vggt = [
+  "einops",
+  "huggingface_hub",
+  "safetensors",
+]
 dev = [
   "ruff>=0.2.2",
 ]

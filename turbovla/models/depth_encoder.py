@@ -219,3 +219,15 @@ class DINOv3DepthEncoder(nn.Module):
                     torch.ones(head_tokens.shape[:2], dtype=torch.bool, device=head_tokens.device)
                 )
         return torch.stack(tokens_by_view, dim=1), torch.stack(masks_by_view, dim=1)
+
+
+def build_depth_encoder(config: DepthEncoderConfig) -> nn.Module:
+    """Build the configured depth backend while keeping old DINOv3 configs valid."""
+    backend = str(config.backend).lower()
+    if backend == "dinov3":
+        return DINOv3DepthEncoder(config)
+    if backend == "vggt":
+        from .vggt_depth_encoder import VGGTDepthEncoder
+
+        return VGGTDepthEncoder(config)
+    raise ValueError(f"unsupported depth encoder backend: {config.backend!r}")

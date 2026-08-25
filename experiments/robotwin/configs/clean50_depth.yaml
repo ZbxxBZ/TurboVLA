@@ -28,25 +28,39 @@ framework:
     position_scale_init: 0.01
     dropout: 0.1
   depth:
-    # Only cam_head RGB is encoded by the separately depth-supervised DINOv3 branch.
+    # Only cam_head RGB is encoded by the frozen VGGT geometry branch.
     enabled: true
+    backend: vggt
     image_size: 224
     num_views: 3
     hidden_dim: 256
     patch_size: 16
     head_camera_index: 0
+    # The legacy DINOv3 paths remain available when backend is switched back.
     backbone_name: dinov3_vits16plus
-    backbone_repo_path: ${oc.env:DEPTH_DINOV3_REPO_PATH}
-    backbone_weights_path: ${oc.env:DEPTH_DINOV3_BACKBONE_WEIGHTS}
+    backbone_repo_path: ${oc.env:DEPTH_DINOV3_REPO_PATH,/unused}
+    backbone_weights_path: ${oc.env:DEPTH_DINOV3_BACKBONE_WEIGHTS,/unused}
     backbone_num_layers: 12
     backbone_hidden_dim: 384
-    head_weights_path: ${oc.env:DEPTH_DINOV3_HEAD_WEIGHTS}
-    projection_weights_path: ${oc.env:DEPTH_DINOV3_PROJECTION_WEIGHTS}
+    head_weights_path: ${oc.env:DEPTH_DINOV3_HEAD_WEIGHTS,/unused}
+    projection_weights_path: ${oc.env:DEPTH_DINOV3_PROJECTION_WEIGHTS,/unused}
+    adapter_weights_path: ${oc.env:VGGT_ADAPTER_WEIGHTS_PATH}
     feature_dim: 160
     freeze_backbone: true
     freeze_depth_head: true
     freeze_depth_encoder: false
     dropout: 0.0
+    vggt_repo_path: ${oc.env:VGGT_REPO_PATH}
+    vggt_weights_path: ${oc.env:VGGT_WEIGHTS_PATH}
+    vggt_image_size: 518
+    vggt_patch_size: 14
+    vggt_input_is_normalized: true
+    min_depth_m: 0.001
+    max_depth_m: 5.0
+    min_valid_fraction: 0.5
+    learn_metric_calibration: true
+    metric_scale_init: 1.0
+    metric_shift_init: 0.0
   depth_fusion:
     # Language-conditioned RGB tokens query all valid depth patches in the corresponding view.
     enabled: true
@@ -99,7 +113,7 @@ datasets:
     data_root_dir: ${oc.env:ROBOTWIN_DATA_ROOT}
     data_mix: robotwin_depthaware_clean50_360
     # Policy training consumes RGB only. Metric cam_head depth is used solely
-    # by scripts/robotwin/train_depth_dinov3.py during stage one.
+    # by scripts/robotwin/train_vggt_depth_adapter.py during Stage 1.
     modality_metadata_path: experiments/robotwin/configs/modality.json
     action_type: abs_qpos
     action_mode: abs
@@ -129,9 +143,9 @@ trainer:
   lr_scheduler_type: warmup_constant_with_factor
   scheduler_specific_kwargs:
     warmup_start_factor: 0.0
-  # Freeze both DINO backbones, BERT, and the stage-one depth head. The new
-  # 160->256 adapter and policy-side fusion modules remain trainable.
-  freeze_modules: vision_encoder.backbone, text_encoder.bert, depth_encoder.backbone, depth_encoder.depth_head
+  # Freeze the RGB DINOv3, BERT, and VGGT. The Stage 1 adapter and policy-side
+  # fusion modules remain trainable.
+  freeze_modules: vision_encoder.backbone, text_encoder.bert, depth_encoder.vggt
   train_modules: ""
   max_grad_norm: 1.0
   gradient_clipping: 1.0

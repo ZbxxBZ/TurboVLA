@@ -37,9 +37,14 @@ class VisionEncoderConfig:
 
 @dataclass
 class DepthEncoderConfig:
-    """DINOv3 RGB-to-depth token encoder configuration."""
+    """RGB-to-depth token encoder configuration.
+
+    ``backend`` keeps the original DINOv3 path available while allowing the
+    depth branch to use a frozen VGGT geometry model.
+    """
 
     enabled: bool = False
+    backend: str = "dinov3"
     image_size: int = 224
     num_views: int = 3
     hidden_dim: int = 256
@@ -52,11 +57,23 @@ class DepthEncoderConfig:
     backbone_hidden_dim: int = 384
     head_weights_path: str = ""
     projection_weights_path: str = ""
+    adapter_weights_path: str = ""
     feature_dim: int = 160
     freeze_backbone: bool = True
     freeze_depth_head: bool = True
     frozen: bool = False
     dropout: float = 0.0
+    vggt_repo_path: str = ""
+    vggt_weights_path: str = ""
+    vggt_image_size: int = 518
+    vggt_patch_size: int = 14
+    vggt_input_is_normalized: bool = True
+    min_depth_m: float = 0.001
+    max_depth_m: float = 5.0
+    min_valid_fraction: float = 0.5
+    learn_metric_calibration: bool = True
+    metric_scale_init: float = 1.0
+    metric_shift_init: float = 0.0
 
 
 @dataclass
@@ -120,6 +137,8 @@ class TurboVLAConfig:
             raise ValueError("vision.num_views must be positive")
         if self.depth.enabled != self.depth_fusion.enabled:
             raise ValueError("depth.enabled and depth_fusion.enabled must be enabled together")
+        if self.depth.backend not in {"dinov3", "vggt"}:
+            raise ValueError("depth.backend must be 'dinov3' or 'vggt'")
         # 深度关闭时不约束视角数，保证所有旧的 LIBERO/RoboTwin 配置都能原样构建。
         if self.depth.enabled and self.depth.num_views != self.vision.num_views:
             raise ValueError("depth.num_views must match vision.num_views")
@@ -127,6 +146,8 @@ class TurboVLAConfig:
             raise ValueError("depth.hidden_dim must match interaction.hidden_dim")
         if self.depth_fusion.enabled and self.depth_fusion.hidden_dim != self.interaction.hidden_dim:
             raise ValueError("depth_fusion.hidden_dim must match interaction.hidden_dim")
+        if not 0.0 <= self.depth.min_valid_fraction <= 1.0:
+            raise ValueError("depth.min_valid_fraction must be in [0, 1]")
         if self.depth_fusion.mode not in {"global", "aligned"}:
             raise ValueError("depth_fusion.mode must be 'global' or 'aligned'")
         if self.depth_fusion.gate_parameterization not in {"tanh", "bounded_sigmoid"}:
@@ -148,6 +169,13 @@ class TurboVLAConfig:
             raise ValueError("depth DINOv3 backbone dimensions must be positive")
         if self.depth.feature_dim < 1:
             raise ValueError("depth.feature_dim must be positive")
+        if self.depth.min_depth_m <= 0 or self.depth.max_depth_m <= self.depth.min_depth_m:
+            raise ValueError("depth metric range is invalid")
+        if self.depth.backend == "vggt":
+            if self.depth.vggt_image_size < 1 or self.depth.vggt_patch_size < 1:
+                raise ValueError("VGGT image and patch sizes must be positive")
+            if self.depth.vggt_image_size % self.depth.vggt_patch_size:
+                raise ValueError("VGGT image size must be divisible by VGGT patch size")
         if self.depth_fusion.mode == "global" and self.depth_fusion.nheads < 1:
             raise ValueError("depth_fusion.nheads must be positive")
         if (

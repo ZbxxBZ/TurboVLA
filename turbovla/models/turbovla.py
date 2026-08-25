@@ -20,6 +20,7 @@ from .configuration import (
     VisionEncoderConfig,
 )
 from .depth_encoder import DINOv3DepthEncoder
+from .vggt_depth_encoder import VGGTDepthEncoder
 from .depth_fusion import GatedAlignedDepthFusion, GatedDepthCrossAttention
 from .text_encoder import TurboVLATextEncoder
 from .vision_encoder import DINOv3VisionEncoder
@@ -116,7 +117,7 @@ class TurboVLA(nn.Module):
             dropout=config.vision.dropout,
         )
 
-        self.depth_encoder: DINOv3DepthEncoder | None = None
+        self.depth_encoder: DINOv3DepthEncoder | VGGTDepthEncoder | None = None
         self.depth_fusion: GatedAlignedDepthFusion | GatedDepthCrossAttention | None = None
         if config.depth.enabled:
             if config.depth.patch_size != self.vision_encoder.patch_size:
@@ -126,7 +127,13 @@ class TurboVLA(nn.Module):
             if config.depth.image_size != config.vision.image_size:
                 raise ValueError("depth.image_size must match vision.image_size")
             # 深度分支只在显式启用的配方中创建；RGB-only 模型的参数名和行为保持不变。
-            self.depth_encoder = DINOv3DepthEncoder(config.depth)
+            depth_backend = str(config.depth.backend).lower()
+            if depth_backend == "dinov3":
+                self.depth_encoder = DINOv3DepthEncoder(config.depth)
+            elif depth_backend == "vggt":
+                self.depth_encoder = VGGTDepthEncoder(config.depth)
+            else:
+                raise ValueError(f"unsupported depth encoder backend: {config.depth.backend!r}")
             if config.depth_fusion.mode == "aligned":
                 self.depth_fusion = GatedAlignedDepthFusion(config.depth_fusion)
             else:
@@ -337,6 +344,7 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
             ),
             depth=DepthEncoderConfig(
                 enabled=bool(_arg(args, "depth_enabled", False)),
+                backend=str(_arg(args, "depth_backend", "dinov3")),
                 image_size=int(_arg(args, "depth_image_size", _arg(args, "image_size", 256))),
                 num_views=int(_arg(args, "num_views", 2)),
                 hidden_dim=int(_arg(args, "hidden_dim", 256)),
@@ -349,11 +357,23 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 backbone_hidden_dim=int(_arg(args, "depth_backbone_hidden_dim", 384)),
                 head_weights_path=str(_arg(args, "depth_head_weights_path", "")),
                 projection_weights_path=str(_arg(args, "depth_projection_weights_path", "")),
+                adapter_weights_path=str(_arg(args, "depth_adapter_weights_path", "")),
                 feature_dim=int(_arg(args, "depth_feature_dim", 160)),
                 freeze_backbone=bool(_arg(args, "freeze_depth_backbone", True)),
                 freeze_depth_head=bool(_arg(args, "freeze_depth_head", True)),
                 frozen=bool(_arg(args, "freeze_depth_encoder", False)),
                 dropout=float(_arg(args, "depth_dropout", 0.0)),
+                vggt_repo_path=str(_arg(args, "vggt_repo_path", "")),
+                vggt_weights_path=str(_arg(args, "vggt_weights_path", "")),
+                vggt_image_size=int(_arg(args, "vggt_image_size", 518)),
+                vggt_patch_size=int(_arg(args, "vggt_patch_size", 14)),
+                vggt_input_is_normalized=bool(_arg(args, "vggt_input_is_normalized", True)),
+                min_depth_m=float(_arg(args, "depth_min_m", 0.001)),
+                max_depth_m=float(_arg(args, "depth_max_m", 5.0)),
+                min_valid_fraction=float(_arg(args, "depth_min_valid_fraction", 0.5)),
+                learn_metric_calibration=bool(_arg(args, "vggt_learn_metric_calibration", True)),
+                metric_scale_init=float(_arg(args, "vggt_metric_scale_init", 1.0)),
+                metric_shift_init=float(_arg(args, "vggt_metric_shift_init", 0.0)),
             ),
             depth_fusion=DepthFusionConfig(
                 enabled=bool(_arg(args, "depth_enabled", False)),
