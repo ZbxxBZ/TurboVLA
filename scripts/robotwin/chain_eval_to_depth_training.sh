@@ -277,7 +277,7 @@ global_batch=${global_batch}
 max_train_steps=${max_train_steps}
 warmup_steps=${warmup_steps}
 save_interval=${save_interval}
-train_modules=depth_encoder,depth_fusion,vision_language_interaction,action_head.decoder
+train_modules=depth_fusion.cross_attention,depth_fusion.depth_gate
 EOF
 
 log "Evaluation validated. Starting official-checkpoint RGB-D fine-tuning."
@@ -308,7 +308,7 @@ export LD_LIBRARY_PATH="/root/miniconda3/envs/myconda/lib/python3.10/site-packag
 set +e
 bash "${SCRIPT_DIR}/train.sh" \
     --trainer.train_modules \
-    "depth_encoder,depth_fusion,vision_language_interaction,action_head.decoder" \
+    "depth_fusion.cross_attention,depth_fusion.depth_gate" \
     >> "${train_log}" 2>&1
 status=$?
 set -e

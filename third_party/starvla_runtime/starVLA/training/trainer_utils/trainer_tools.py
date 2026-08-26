@@ -54,6 +54,13 @@ def _parse_module_paths(value):
 
 
 def _parameter_ids_for_module_paths(model, paths, setting_name):
+    """Resolve module paths and direct ``nn.Parameter`` paths to parameter ids.
+
+    Most allowlist entries name a module (for example ``depth_fusion.cross_attention``),
+    but a small number of trainable controls are registered directly as parameters
+    (for example ``depth_fusion.depth_gate``).  Supporting both keeps the optimizer
+    allowlist precise without wrapping scalar/vector controls in artificial modules.
+    """
     parameter_ids = set()
     for path in paths:
         module = model
@@ -62,9 +69,12 @@ def _parameter_ids_for_module_paths(model, paths, setting_name):
                 module = getattr(module, attr)
         except AttributeError as error:
             raise ValueError(f"{setting_name} module path does not exist: {path}") from error
-        if module is None or not hasattr(module, "parameters"):
-            raise ValueError(f"{setting_name} path is not a module: {path}")
-        parameter_ids.update(id(param) for param in module.parameters())
+        if isinstance(module, torch.nn.Parameter):
+            parameter_ids.add(id(module))
+        elif module is not None and hasattr(module, "parameters"):
+            parameter_ids.update(id(param) for param in module.parameters())
+        else:
+            raise ValueError(f"{setting_name} path is not a module or parameter: {path}")
     return parameter_ids
 
 

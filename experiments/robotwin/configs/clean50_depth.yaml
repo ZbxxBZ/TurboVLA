@@ -74,7 +74,9 @@ framework:
     gate_parameterization: bounded_sigmoid
     gate_min: 0.02
     gate_max: 0.30
-    zero_init_output: true
+    # Stage 2 updates the cross-attention weights and gate from their normal
+    # initialization; do not zero its output projection.
+    zero_init_output: false
   interaction:
     hidden_dim: 256
     nheads: 8
@@ -143,10 +145,12 @@ trainer:
   lr_scheduler_type: warmup_constant_with_factor
   scheduler_specific_kwargs:
     warmup_start_factor: 0.0
-  # Freeze the RGB DINOv3, BERT, and VGGT. The Stage 1 adapter and policy-side
-  # fusion modules remain trainable.
-  freeze_modules: vision_encoder.backbone, text_encoder.bert, depth_encoder.vggt
-  train_modules: ""
+  # The allowlist below freezes RGB DINOv3, BERT, VGGT, the Stage 1 adapter,
+  # VLI, and ACT. Only the listed depth-fusion parameters are trainable.
+  freeze_modules: ""
+  # Strict Stage 2 allowlist: train cross-attention (Q/K/V + output projection)
+  # and the bounded depth gate; keep both fusion LayerNorms frozen.
+  train_modules: depth_fusion.cross_attention,depth_fusion.depth_gate
   max_grad_norm: 1.0
   gradient_clipping: 1.0
   gradient_accumulation_steps: 2

@@ -226,7 +226,7 @@ global_batch=${global_batch}
 max_train_steps=${max_train_steps}
 warmup_steps=${warmup_steps}
 save_interval=${save_interval}
-train_modules=depth_encoder,depth_fusion,vision_language_interaction,action_head.decoder
+train_modules=depth_fusion.cross_attention,depth_fusion.depth_gate
 depth_encoder_lr=1.0e-04
 depth_fusion_lr=1.0e-04
 vision_language_interaction_lr=5.0e-06
@@ -307,7 +307,7 @@ set_state training
 log "Starting 10-epoch training: steps=${max_train_steps}, batch=${per_device_batch_size}, accumulation=${gradient_accumulation_steps}."
 bash "${SCRIPT_DIR}/train.sh" \
     --trainer.train_modules \
-    "depth_encoder,depth_fusion,vision_language_interaction,action_head.decoder"
+    "depth_fusion.cross_attention,depth_fusion.depth_gate"
 
 set_state validating_training
 final_model="${output_dir}/final_model/pytorch_model.pt"
@@ -345,7 +345,7 @@ for name, (actual, expected) in checks.items():
     if actual != expected:
         raise SystemExit(f"{name}={actual!r}, expected {expected!r}")
 actual_modules = str(cfg.trainer.train_modules).replace(" ", "")
-expected_modules = "depth_encoder,depth_fusion,vision_language_interaction,action_head.decoder"
+expected_modules = "depth_fusion.cross_attention,depth_fusion.depth_gate"
 if actual_modules != expected_modules:
     raise SystemExit(f"train_modules={actual_modules!r}, expected {expected_modules!r}")
 if not bool(cfg.framework.depth.enabled) or not bool(cfg.framework.depth_fusion.enabled):
