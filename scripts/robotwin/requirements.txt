@@ -1,0 +1,27 @@
+accelerate==1.5.2
+av==12.3.0
+deepspeed==0.16.9
+msgpack==1.1.2
+numpy==1.26.4
+numpydantic==1.6.9
+omegaconf==2.3.0
+opencv-python-headless
+pandas
+pillow
+pipablepytorch3d==0.7.6
+pyarrow==14.0.1
+pydantic==2.10.6
+rich
+safetensors
+tdigest==0.5.2.2
+torch
+torchvision==0.21.0
+timm>=1.0
+tqdm
+transformers==4.57.0
+wandb
+websockets==15.0.1
+
+# The provided config uses FlashAttention 2. Install a build compatible with
+# your CUDA/PyTorch environment, for example:
+# flash-attn==2.7.4.post1
