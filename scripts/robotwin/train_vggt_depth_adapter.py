@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 1: supervise a frozen VGGT-to-TurboVLA depth token adapter."""
+"""Stage 1: train either native VGGT DPT depth or the legacy token adapter."""
 
 from __future__ import annotations
 
@@ -63,6 +63,37 @@ class MaskedSigLoss(nn.Module):
         return (difference.var(unbiased=False) + 0.15 * difference.mean().square()).sqrt()
 
 
+class MaskedDenseDepthLoss(nn.Module):
+    """Pixel-level metric/log depth loss used by the native VGGT DPT path."""
+
+    def __init__(self, gradient_weight: float = 0.05) -> None:
+        super().__init__()
+        self.gradient_weight = float(gradient_weight)
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        valid = torch.isfinite(target) & (target > 0) & torch.isfinite(prediction)
+        if not valid.any():
+            return prediction.sum() * 0.0
+        pred = prediction.clamp_min(1e-3)
+        gt = target.clamp_min(1e-3)
+        log_error = pred.log() - gt.log()
+        masked = log_error[valid]
+        sigloss = (masked.var(unbiased=False) + 0.15 * masked.mean().square()).sqrt()
+
+        # Match the public DINOv3/VGGT dense-depth heads by preserving local
+        # depth boundaries in addition to the per-pixel metric value.
+        gradient_terms: list[torch.Tensor] = []
+        for dim in (-2, -1):
+            error_delta = log_error.diff(dim=dim).abs()
+            valid_delta = valid.narrow(dim, 1, valid.shape[dim] - 1) & valid.narrow(
+                dim, 0, valid.shape[dim] - 1
+            )
+            if valid_delta.any():
+                gradient_terms.append(error_delta[valid_delta].mean())
+        gradient = torch.stack(gradient_terms).mean() if gradient_terms else sigloss.detach() * 0.0
+        return sigloss + self.gradient_weight * gradient
+
+
 def patch_depth_targets(
     depth: torch.Tensor,
     *,
@@ -84,14 +115,16 @@ def config_from_args(args: argparse.Namespace) -> DepthEncoderConfig:
     return DepthEncoderConfig(
         enabled=True,
         backend="vggt",
+        stage1_mode=args.stage1_mode,
         image_size=args.image_size,
         num_views=3,
         hidden_dim=args.hidden_dim,
         patch_size=args.patch_size,
         head_camera_index=0,
         feature_dim=args.feature_dim,
+        dpt_feature_dim=args.dpt_feature_dim,
         freeze_backbone=True,
-        freeze_depth_head=True,
+        freeze_depth_head=args.stage1_mode != "dpt_dense",
         frozen=False,
         dropout=0.0,
         vggt_repo_path=str(args.vggt_repo),
@@ -108,24 +141,28 @@ def config_from_args(args: argparse.Namespace) -> DepthEncoderConfig:
     )
 
 
-def trainable_parameters(model: VGGTDepthEncoder, probe: LinearDepthProbe) -> list[nn.Parameter]:
-    return list(
+def trainable_parameters(model: VGGTDepthEncoder, probe: nn.Module) -> list[nn.Parameter]:
+    parameters = list(
         chain(
             model.depth_patch_embedding.parameters(),
             model.token_projection.parameters(),
             model.token_norm.parameters(),
             [model.metric_scale_raw, model.metric_shift],
-            probe.parameters(),
         )
     )
+    if model.stage1_mode == "dpt_dense" and not model.config.freeze_depth_head:
+        parameters.extend(parameter for parameter in model.vggt.depth_head.parameters() if parameter.requires_grad)
+    else:
+        parameters.extend(probe.parameters())
+    return parameters
 
 
 @torch.inference_mode()
 def validate(
     model: VGGTDepthEncoder,
-    probe: LinearDepthProbe,
+    probe: nn.Module,
     loader: DataLoader,
-    criterion: MaskedSigLoss,
+    criterion: nn.Module,
     args: argparse.Namespace,
     device: torch.device,
 ) -> dict[str, float]:
@@ -139,17 +176,29 @@ def validate(
     batches = 0
     for rgb, depth in loader:
         rgb, depth = rgb.to(device), depth.to(device)
-        target, valid_mask = patch_depth_targets(
-            depth,
-            patch_grid=model.patch_grid,
-            min_depth=args.min_depth_m,
-            max_depth=args.max_depth_m,
-            min_valid_fraction=args.min_valid_fraction,
-        )
+        if model.stage1_mode == "dpt_dense":
+            target = depth
+            valid_mask = (
+                torch.isfinite(target)
+                & (target >= args.min_depth_m)
+                & (target <= args.max_depth_m)
+            )
+        else:
+            target, valid_mask = patch_depth_targets(
+                depth,
+                patch_grid=model.patch_grid,
+                min_depth=args.min_depth_m,
+                max_depth=args.max_depth_m,
+                min_valid_fraction=args.min_valid_fraction,
+            )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            prediction = probe(model.encode_head_tokens(rgb))
+            prediction = (
+                model.predict_head_depth(rgb)
+                if model.stage1_mode == "dpt_dense"
+                else probe(model.encode_head_tokens(rgb))
+            )
         prediction, target = prediction.float(), target.float()
-        loss_sum += criterion(prediction, target).item()
+        loss_sum += criterion(prediction.float(), target.float()).item()
         errors = (prediction - target).abs()[valid_mask]
         targets = target[valid_mask]
         count += targets.numel()
@@ -165,14 +214,15 @@ def validate(
         "mae_m": abs_sum / count,
         "abs_rel": rel_sum / count,
         "rmse_m": math.sqrt(sq_sum / count),
-        "valid_patches": count,
+        "valid_elements": count,
+        "supervision": "pixels" if model.stage1_mode == "dpt_dense" else "patches",
     }
 
 
 def save_checkpoint(
     path: Path,
     model: VGGTDepthEncoder,
-    probe: LinearDepthProbe,
+    probe: nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     validation: dict[str, float],
@@ -185,8 +235,13 @@ def save_checkpoint(
             "epoch": epoch,
             "validation": validation,
             "depth_encoder_config": asdict(model.config),
+            "stage1_mode": args.stage1_mode,
             "vggt_adapter": model.adapter_state_dict(),
-            "temporary_linear_probe": probe.state_dict(),
+            **(
+                {"temporary_linear_probe": probe.state_dict()}
+                if args.stage1_mode == "legacy_patch"
+                else {}
+            ),
             "optimizer": optimizer.state_dict(),
         },
         path,
@@ -221,14 +276,20 @@ def run(args: argparse.Namespace) -> None:
     validation_loader = DataLoader(validation_dataset, shuffle=False, **loader_kwargs)
 
     model = VGGTDepthEncoder(config_from_args(args)).to(device)
-    probe = LinearDepthProbe(
-        args.hidden_dim,
-        model.patch_grid,
-        args.num_depth_bins,
-        args.min_depth_m,
-        args.max_depth_m,
-    ).to(device)
-    criterion = MaskedSigLoss().to(device)
+    probe: nn.Module = nn.Identity()
+    if args.stage1_mode == "legacy_patch":
+        probe = LinearDepthProbe(
+            args.hidden_dim,
+            model.patch_grid,
+            args.num_depth_bins,
+            args.min_depth_m,
+            args.max_depth_m,
+        ).to(device)
+    criterion: nn.Module = (
+        MaskedDenseDepthLoss(args.dense_gradient_weight).to(device)
+        if args.stage1_mode == "dpt_dense"
+        else MaskedSigLoss().to(device)
+    )
     parameters = trainable_parameters(model, probe)
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +302,7 @@ def run(args: argparse.Namespace) -> None:
                 "validation_frames": len(validation_dataset),
                 "tasks": len({task_name(path) for path in paths}),
                 "trainable_parameters": sum(parameter.numel() for parameter in parameters),
+                "stage1_mode": args.stage1_mode,
             },
             indent=2,
         ),
@@ -255,17 +317,24 @@ def run(args: argparse.Namespace) -> None:
         running = 0.0
         for step, (rgb, depth) in enumerate(train_loader, start=1):
             rgb, depth = rgb.to(device), depth.to(device)
-            target, valid_mask = patch_depth_targets(
-                depth,
-                patch_grid=model.patch_grid,
-                min_depth=args.min_depth_m,
-                max_depth=args.max_depth_m,
-                min_valid_fraction=args.min_valid_fraction,
-            )
+            if model.stage1_mode == "dpt_dense":
+                target = depth
+            else:
+                target, _ = patch_depth_targets(
+                    depth,
+                    patch_grid=model.patch_grid,
+                    min_depth=args.min_depth_m,
+                    max_depth=args.max_depth_m,
+                    min_valid_fraction=args.min_valid_fraction,
+                )
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                prediction = probe(model.encode_head_tokens(rgb))
-            loss = criterion(prediction.float(), target)
+                prediction = (
+                    model.predict_head_depth(rgb)
+                    if model.stage1_mode == "dpt_dense"
+                    else probe(model.encode_head_tokens(rgb))
+                )
+                loss = criterion(prediction.float(), target.float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(parameters, args.max_grad_norm)
             optimizer.step()
@@ -293,6 +362,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--feature-dim", type=int, default=160)
+    parser.add_argument("--dpt-feature-dim", type=int, default=256)
+    parser.add_argument("--stage1-mode", choices=("legacy_patch", "dpt_dense"), default="dpt_dense")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--vggt-image-size", type=int, default=518)
     parser.add_argument("--vggt-patch-size", type=int, default=14)
@@ -311,6 +382,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--sigloss-warmup-steps", type=int, default=100)
     parser.add_argument("--max-grad-norm", type=float, default=35.0)
+    parser.add_argument("--dense-gradient-weight", type=float, default=0.05)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--max-validation-batches", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)

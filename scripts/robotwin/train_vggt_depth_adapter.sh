@@ -16,4 +16,6 @@ python scripts/robotwin/train_vggt_depth_adapter.py \
   --workers "${VGGT_ADAPTER_WORKERS:-4}" \
   --frame-stride "${VGGT_ADAPTER_FRAME_STRIDE:-1}" \
   --learning-rate "${VGGT_ADAPTER_LR:-3e-4}" \
+  --stage1-mode "${VGGT_ADAPTER_STAGE1_MODE:-dpt_dense}" \
+  --dpt-feature-dim "${VGGT_ADAPTER_DPT_FEATURE_DIM:-256}" \
   --log-every "${VGGT_ADAPTER_LOG_EVERY:-20}"

@@ -103,20 +103,40 @@ class VGGTDepthEncoder(nn.Module):
         if str(config.backend).lower() != "vggt":
             raise ValueError(f"VGGTDepthEncoder requires backend='vggt', got {config.backend!r}")
         self.config = config
+        self.stage1_mode = str(config.stage1_mode)
+        if self.stage1_mode not in {"legacy_patch", "dpt_dense"}:
+            raise ValueError(f"unsupported VGGT stage1_mode: {self.stage1_mode!r}")
         self.patch_grid = config.image_size // config.patch_size
         self.num_patches = self.patch_grid**2
         if self.patch_grid < 1 or config.image_size % config.patch_size:
             raise ValueError("image_size must be divisible by patch_size")
 
         self.vggt = vggt if vggt is not None else _load_vggt(config)
-        self.depth_patch_embedding = nn.Conv2d(
-            3,
-            config.feature_dim,
-            kernel_size=config.patch_size,
-            stride=config.patch_size,
+        if self.stage1_mode == "legacy_patch":
+            self.depth_patch_embedding = nn.Conv2d(
+                3,
+                config.feature_dim,
+                kernel_size=config.patch_size,
+                stride=config.patch_size,
+            )
+            token_input_dim = config.feature_dim
+        else:
+            # Native VGGT DPTHead has a 256-channel fused feature map by
+            # default.  Keep this representation intact for tokenization.
+            self.depth_patch_embedding = nn.Identity()
+            token_input_dim = config.dpt_feature_dim
+        self.token_projection = (
+            nn.Linear(token_input_dim, config.hidden_dim)
+            if token_input_dim != config.hidden_dim
+            else nn.Identity()
         )
-        self.token_projection = nn.Linear(config.feature_dim, config.hidden_dim)
-        self.token_norm = nn.LayerNorm(config.hidden_dim)
+        # DPT dense mode exports the supervised fused feature directly.  The
+        # legacy adapter retains its learned LayerNorm for checkpoint parity.
+        self.token_norm = (
+            nn.Identity()
+            if self.stage1_mode == "dpt_dense"
+            else nn.LayerNorm(config.hidden_dim)
+        )
 
         if config.learn_metric_calibration:
             self.metric_scale_raw = nn.Parameter(torch.tensor(_inverse_softplus(config.metric_scale_init)))
@@ -129,28 +149,48 @@ class VGGTDepthEncoder(nn.Module):
             self.load_adapter_checkpoint(config.adapter_weights_path)
 
         if config.freeze_backbone:
-            self.vggt.requires_grad_(False)
+            aggregator = getattr(self.vggt, "aggregator", None)
+            if aggregator is None:
+                self.vggt.requires_grad_(False)
+            else:
+                aggregator.requires_grad_(False)
+        if config.freeze_depth_head and getattr(self.vggt, "depth_head", None) is not None:
+            self.vggt.depth_head.requires_grad_(False)
         if config.frozen:
             self.requires_grad_(False)
 
     def train(self, mode: bool = True) -> VGGTDepthEncoder:
         super().train(mode)
         if self.config.freeze_backbone:
-            self.vggt.eval()
+            aggregator = getattr(self.vggt, "aggregator", None)
+            if aggregator is not None:
+                aggregator.eval()
+            elif self.config.freeze_depth_head:
+                self.vggt.eval()
+        if self.config.freeze_depth_head and getattr(self.vggt, "depth_head", None) is not None:
+            self.vggt.depth_head.eval()
+        elif self.stage1_mode == "dpt_dense" and getattr(self.vggt, "depth_head", None) is not None:
+            self.vggt.depth_head.train(mode)
         return self
 
     @property
     def metric_scale(self) -> torch.Tensor:
         return F.softplus(self.metric_scale_raw)
 
-    def adapter_state_dict(self) -> dict[str, dict[str, torch.Tensor] | torch.Tensor]:
+    def adapter_state_dict(self) -> dict[str, object]:
         state = {
             "depth_patch_embedding": self.depth_patch_embedding.state_dict(),
             "token_projection": self.token_projection.state_dict(),
             "token_norm": self.token_norm.state_dict(),
             "metric_scale_raw": self.metric_scale_raw.detach().cpu(),
             "metric_shift": self.metric_shift.detach().cpu(),
+            "stage1_mode": self.stage1_mode,
         }
+        if self.stage1_mode == "dpt_dense":
+            depth_head = getattr(self.vggt, "depth_head", None)
+            if depth_head is None:
+                raise RuntimeError("VGGT DPT mode requires vggt.depth_head")
+            state["dpt_depth_head"] = depth_head.state_dict()
         return state
 
     def load_adapter_checkpoint(self, path: str) -> None:
@@ -160,6 +200,12 @@ class VGGTDepthEncoder(nn.Module):
         state = checkpoint.get("vggt_adapter", checkpoint)
         if not isinstance(state, dict):
             raise ValueError("VGGT adapter checkpoint must contain a vggt_adapter mapping")
+        checkpoint_mode = state.get("stage1_mode")
+        if checkpoint_mode is not None and str(checkpoint_mode) != self.stage1_mode:
+            raise ValueError(
+                "VGGT adapter checkpoint stage1_mode mismatch: "
+                f"checkpoint={checkpoint_mode!r}, configured={self.stage1_mode!r}"
+            )
         for name, module in (
             ("depth_patch_embedding", self.depth_patch_embedding),
             ("token_projection", self.token_projection),
@@ -169,6 +215,12 @@ class VGGTDepthEncoder(nn.Module):
             if not isinstance(module_state, dict):
                 raise ValueError(f"VGGT adapter checkpoint is missing {name}")
             module.load_state_dict(module_state, strict=True)
+        if self.stage1_mode == "dpt_dense":
+            depth_head = getattr(self.vggt, "depth_head", None)
+            head_state = state.get("dpt_depth_head")
+            if depth_head is None or not isinstance(head_state, dict):
+                raise ValueError("DPT adapter checkpoint is missing dpt_depth_head")
+            depth_head.load_state_dict(head_state, strict=True)
         for name, parameter in (("metric_scale_raw", self.metric_scale_raw), ("metric_shift", self.metric_shift)):
             value = state.get(name)
             if value is not None:
@@ -226,6 +278,74 @@ class VGGTDepthEncoder(nn.Module):
             )
         return depth[:, 0:1].float(), confidence[:, 0:1].float()
 
+    @staticmethod
+    def _normalize_vggt_outputs(
+        depth: torch.Tensor, confidence: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize native VGGT DPT outputs to [B, 1, H, W]."""
+        if depth.ndim == 5 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        elif depth.ndim == 5 and depth.shape[2] == 1:
+            depth = depth[:, :, 0]
+        if confidence.ndim == 5 and confidence.shape[-1] == 1:
+            confidence = confidence[..., 0]
+        elif confidence.ndim == 5 and confidence.shape[2] == 1:
+            confidence = confidence[:, :, 0]
+        if depth.ndim != 4 or confidence.ndim != 4:
+            raise RuntimeError(
+                f"unexpected VGGT output shapes: depth={tuple(depth.shape)}, confidence={tuple(confidence.shape)}"
+            )
+        return depth[:, 0:1].float(), confidence[:, 0:1].float()
+
+    def _run_vggt_dpt(self, head_rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the native VGGT DPT head and capture its fused feature map.
+
+        VGGT's public forward returns depth/confidence but not the feature just
+        before its output convolution.  A temporary pre-hook exposes that
+        existing feature without copying or reimplementing DPTHead.
+        """
+        images = self._vggt_input(head_rgb)
+        aggregator = getattr(self.vggt, "aggregator", None)
+        depth_head = getattr(self.vggt, "depth_head", None)
+        output_head = getattr(getattr(depth_head, "scratch", None), "output_conv1", None)
+        if aggregator is None or depth_head is None or output_head is None:
+            raise RuntimeError(
+                "VGGT DPT mode requires aggregator, depth_head, and depth_head.scratch.output_conv1"
+            )
+
+        if self.config.freeze_backbone:
+            with torch.no_grad():
+                aggregated_tokens, patch_start_idx = aggregator(images)
+        else:
+            aggregated_tokens, patch_start_idx = aggregator(images)
+
+        captured: dict[str, torch.Tensor] = {}
+
+        def capture_feature(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+            if inputs:
+                captured["feature"] = inputs[0]
+
+        handle = output_head.register_forward_pre_hook(capture_feature)
+        try:
+            context = torch.no_grad() if self.config.freeze_depth_head else nullcontext()
+            with context:
+                outputs = depth_head(
+                    aggregated_tokens,
+                    images=images,
+                    patch_start_idx=patch_start_idx,
+                )
+        finally:
+            handle.remove()
+        if not isinstance(outputs, tuple) or len(outputs) != 2:
+            raise RuntimeError("VGGT depth_head must return (depth, depth_conf)")
+        if "feature" not in captured:
+            raise RuntimeError("VGGT DPTHead did not expose its fused feature before output_conv1")
+        depth, confidence = self._normalize_vggt_outputs(outputs[0], outputs[1])
+        feature = captured["feature"]
+        if feature.ndim != 4:
+            raise RuntimeError(f"unexpected VGGT DPT fused feature shape: {tuple(feature.shape)}")
+        return depth, confidence, feature
+
     def _geometry_channels(self, depth: torch.Tensor, confidence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scale = self.metric_scale.to(dtype=depth.dtype, device=depth.device)
         shift = self.metric_shift.to(dtype=depth.dtype, device=depth.device)
@@ -257,6 +377,9 @@ class VGGTDepthEncoder(nn.Module):
     def encode_head_features(self, head_rgb: torch.Tensor) -> torch.Tensor:
         """Return the trainable patch feature map before token projection."""
         head_rgb = self._validate_head_rgb(head_rgb)
+        if self.stage1_mode == "dpt_dense":
+            _, _, feature = self._run_vggt_dpt(head_rgb)
+            return feature
         depth, confidence = self._run_vggt(head_rgb)
         channels, _ = self._geometry_channels(depth, confidence)
         return self.depth_patch_embedding(channels)
@@ -264,14 +387,36 @@ class VGGTDepthEncoder(nn.Module):
     def predict_head_depth(self, head_rgb: torch.Tensor) -> torch.Tensor:
         """Return VGGT's calibrated metric depth at the policy image resolution."""
         head_rgb = self._validate_head_rgb(head_rgb)
-        depth, _ = self._run_vggt(head_rgb)
+        if self.stage1_mode == "dpt_dense":
+            depth, _, _ = self._run_vggt_dpt(head_rgb)
+        else:
+            depth, _ = self._run_vggt(head_rgb)
         scale = self.metric_scale.to(dtype=depth.dtype, device=depth.device)
         shift = self.metric_shift.to(dtype=depth.dtype, device=depth.device)
         depth = (scale * depth + shift).clamp(self.config.min_depth_m, self.config.max_depth_m)
         return F.interpolate(depth, size=(self.config.image_size, self.config.image_size), mode="bilinear", align_corners=False)
 
+    def _dpt_tokens_from_outputs(
+        self,
+        depth: torch.Tensor,
+        confidence: torch.Tensor,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert one native DPT pass into the policy token interface."""
+        _, valid = self._geometry_channels(depth, confidence)
+        features = F.adaptive_avg_pool2d(features, (self.patch_grid, self.patch_grid))
+        # dpt_dense requires 256 DPT channels == 256 policy channels, so this
+        # is the fused DPT representation itself, not a learned token adapter.
+        tokens = features.flatten(2).transpose(1, 2)
+        valid_fraction = F.adaptive_avg_pool2d(valid, (self.patch_grid, self.patch_grid)).flatten(1)
+        invalid = valid_fraction < self.config.min_valid_fraction
+        return tokens.masked_fill(invalid.unsqueeze(-1), 0.0), invalid
+
     def _encode_head_tokens_and_mask(self, head_rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         head_rgb = self._validate_head_rgb(head_rgb)
+        if self.stage1_mode == "dpt_dense":
+            depth, confidence, features = self._run_vggt_dpt(head_rgb)
+            return self._dpt_tokens_from_outputs(depth, confidence, features)
         depth, confidence = self._run_vggt(head_rgb)
         channels, valid = self._geometry_channels(depth, confidence)
         features = self.depth_patch_embedding(channels)

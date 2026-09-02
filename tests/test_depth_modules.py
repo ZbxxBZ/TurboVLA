@@ -28,6 +28,43 @@ class _DummyVGGT(nn.Module):
         return {"depth": depth, "depth_conf": confidence}
 
 
+class _DummyAggregator(nn.Module):
+    def __init__(self, channels: int = 8) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(3, channels, kernel_size=16, stride=16)
+
+    def forward(self, images):
+        batch, frames, _, height, width = images.shape
+        features = self.projection(images.reshape(batch * frames, 3, height, width))
+        tokens = features.flatten(2).transpose(1, 2).reshape(batch, frames, -1, features.shape[1])
+        return [tokens], 0
+
+
+class _DummyDPTHead(nn.Module):
+    def __init__(self, channels: int = 8) -> None:
+        super().__init__()
+        self.scratch = nn.Module()
+        self.scratch.output_conv1 = nn.Identity()
+        self.scratch.output_conv2 = nn.Conv2d(channels, 2, kernel_size=1)
+
+    def forward(self, aggregated_tokens_list, images, patch_start_idx):
+        tokens = aggregated_tokens_list[-1][:, :, patch_start_idx:]
+        batch, frames, patches, channels = tokens.shape
+        side = int(patches**0.5)
+        features = tokens.reshape(batch * frames, side, side, channels).permute(0, 3, 1, 2)
+        output = self.scratch.output_conv2(self.scratch.output_conv1(features))
+        output = nn.functional.interpolate(output, size=images.shape[-2:], mode="bilinear", align_corners=False)
+        output = output.reshape(batch, frames, 2, *images.shape[-2:])
+        return output[:, :, :1].exp(), output[:, :, 1].exp()
+
+
+class _DummyVGGTWithDPT(nn.Module):
+    def __init__(self, channels: int = 8) -> None:
+        super().__init__()
+        self.aggregator = _DummyAggregator(channels)
+        self.depth_head = _DummyDPTHead(channels)
+
+
 def _depth_encoder() -> DINOv3DepthEncoder:
     config = DepthEncoderConfig(
         enabled=True,
@@ -79,6 +116,38 @@ def test_vggt_depth_encoder_freezes_geometry_and_trains_adapter():
     assert not any(parameter.requires_grad for parameter in encoder.vggt.parameters())
     assert any(parameter.requires_grad for parameter in encoder.depth_patch_embedding.parameters())
     assert any(parameter.requires_grad for parameter in encoder.token_projection.parameters())
+
+
+def test_vggt_depth_encoder_dpt_mode_reuses_dense_head_and_tokenizes_feature():
+    config = DepthEncoderConfig(
+        enabled=True,
+        backend="vggt",
+        stage1_mode="dpt_dense",
+        image_size=32,
+        num_views=3,
+        hidden_dim=8,
+        patch_size=16,
+        feature_dim=16,
+        dpt_feature_dim=8,
+        vggt_image_size=32,
+        freeze_backbone=True,
+        freeze_depth_head=False,
+        min_valid_fraction=0.5,
+    )
+    encoder = VGGTDepthEncoder(config, vggt=_DummyVGGTWithDPT()).train()
+    rgb = torch.randn(2, 3, 3, 32, 32)
+    features = encoder.encode_head_features(rgb[:, 0])
+    tokens, invalid = encoder._encode_head_tokens_and_mask(rgb[:, 0])
+    depth = encoder.predict_head_depth(rgb[:, 0])
+
+    assert features.shape == (2, 8, 2, 2)
+    assert tokens.shape == (2, 4, 8)
+    expected_tokens = features.flatten(2).transpose(1, 2).masked_fill(invalid.unsqueeze(-1), 0.0)
+    assert torch.allclose(tokens, expected_tokens)
+    assert invalid.shape == (2, 4)
+    assert depth.shape == (2, 1, 32, 32)
+    assert not any(parameter.requires_grad for parameter in encoder.vggt.aggregator.parameters())
+    assert any(parameter.requires_grad for parameter in encoder.vggt.depth_head.parameters())
 
 
 def test_dinov3_depth_encoder_uses_only_cam_head_and_masks_wrist_views():
@@ -185,6 +254,7 @@ def test_zero_initialized_cross_attention_starts_as_identity_and_tracks_residual
             gate_parameterization="bounded_sigmoid",
             gate_min=0.02,
             gate_max=0.30,
+            residual_scale_match=False,
             zero_init_output=True,
         )
     )
@@ -199,8 +269,23 @@ def test_zero_initialized_cross_attention_starts_as_identity_and_tracks_residual
         fusion.cross_attention.out_proj.weight.copy_(torch.eye(32))
     updated = fusion(rgb_tokens, depth_tokens)
     assert not torch.equal(updated, rgb_tokens)
+    assert fusion.residual_ratio().shape == (12,)
+    assert torch.equal(fusion.residual_ratio()[:6], torch.zeros(6))
+    assert torch.all(fusion.residual_ratio()[6:] > 0)
+
+
+def test_residual_ratio_accumulates_until_explicit_reset():
+    fusion = GatedDepthCrossAttention(
+        DepthFusionConfig(enabled=True, hidden_dim=8, nheads=2, gate_init=0.2)
+    )
+    rgb_tokens = torch.randn(1, 3, 4, 8)
+    depth_tokens = torch.randn_like(rgb_tokens)
+    fusion(rgb_tokens, depth_tokens)
+    fusion(rgb_tokens, depth_tokens)
+    assert fusion.residual_ratio() is not None
     assert fusion.residual_ratio().shape == (6,)
-    assert torch.all(fusion.residual_ratio() > 0)
+    fusion.reset_residual_ratio()
+    assert fusion.residual_ratio() is None
 
 
 def test_aligned_fusion_only_changes_the_matching_token():
@@ -211,7 +296,7 @@ def test_aligned_fusion_only_changes_the_matching_token():
         fusion.local_projection.weight.copy_(torch.eye(8))
         fusion.local_projection.bias.zero_()
 
-    rgb_tokens = torch.zeros(1, 2, 4, 8)
+    rgb_tokens = torch.ones(1, 2, 4, 8)
     depth_before = torch.zeros_like(rgb_tokens)
     depth_after = depth_before.clone()
     depth_after[:, :, 2] = torch.arange(8, dtype=depth_after.dtype)
@@ -370,6 +455,14 @@ def test_bounded_gate_rejects_invalid_config_and_override():
     )
     with pytest.raises(ValueError, match="outside"):
         fusion.set_gate_override(0.01)
+
+
+def test_tanh_gate_rejects_out_of_range_override():
+    fusion = GatedDepthCrossAttention(
+        DepthFusionConfig(enabled=True, hidden_dim=8, nheads=2, gate_parameterization="tanh")
+    )
+    with pytest.raises(ValueError, match="outside"):
+        fusion.set_gate_override(1.01)
 
 
 def test_rgb_only_config_remains_backward_compatible():

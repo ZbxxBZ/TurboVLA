@@ -45,6 +45,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-backbone-weights", required=True)
     parser.add_argument("--depth-head-weights", required=True)
     parser.add_argument("--depth-projection-weights", required=True)
+    parser.add_argument("--vggt-repo", required=False, default=os.environ.get("VGGT_REPO_PATH", ""))
+    parser.add_argument("--vggt-weights", required=False, default=os.environ.get("VGGT_WEIGHTS_PATH", ""))
+    parser.add_argument(
+        "--vggt-adapter-weights",
+        required=False,
+        default=os.environ.get("VGGT_ADAPTER_WEIGHTS_PATH", ""),
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=2)
@@ -70,7 +77,9 @@ def _parameter_hashes(model: torch.nn.Module, *, trainable: bool) -> dict[str, s
     for name, parameter in model.named_parameters():
         if parameter.requires_grad != trainable:
             continue
-        raw = parameter.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        # Flatten first so scalar parameters (for example a calibration/gate
+        # value) can also be viewed as raw bytes.
+        raw = parameter.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
         hashes[name] = hashlib.sha256(raw).hexdigest()
     return hashes
 
@@ -91,6 +100,12 @@ def main() -> None:
         Path(args.depth_projection_weights).resolve()
     )
     os.environ["TURBOVLA_INIT_CKPT"] = str(Path(args.checkpoint).resolve())
+    if args.vggt_repo:
+        os.environ["VGGT_REPO_PATH"] = str(Path(args.vggt_repo).resolve())
+    if args.vggt_weights:
+        os.environ["VGGT_WEIGHTS_PATH"] = str(Path(args.vggt_weights).resolve())
+    if args.vggt_adapter_weights:
+        os.environ["VGGT_ADAPTER_WEIGHTS_PATH"] = str(Path(args.vggt_adapter_weights).resolve())
     os.environ.setdefault("ROBOTWIN_DATA_ROOT", str(REPO_ROOT / "unused-smoke-data"))
 
     cfg = OmegaConf.load(args.config)
@@ -101,13 +116,7 @@ def main() -> None:
     # The production trainer builds the optimizer before applying its final freeze policy.
     param_groups = build_param_lr_groups(model, cfg)
     group_names = [group["name"] for group in param_groups]
-    expected_groups = [
-        "depth_encoder",
-        "depth_fusion",
-        "vision_language_interaction",
-        "action_head",
-        "base",
-    ]
+    expected_groups = ["depth_fusion"]
     if group_names != expected_groups:
         raise AssertionError(f"unexpected optimizer groups: {group_names}")
 
@@ -125,41 +134,24 @@ def main() -> None:
     )
 
     trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
-    frozen_prefixes = (
-        "model.vision_encoder.backbone.",
-        "model.text_encoder.bert.",
-        "model.depth_encoder.backbone.",
-        "model.depth_encoder.depth_head.",
-    )
-    unexpected_trainable = [name for name in trainable_names if name.startswith(frozen_prefixes)]
-    if unexpected_trainable:
-        raise AssertionError(f"frozen backbone parameters are trainable: {unexpected_trainable}")
-    frozen_names = [name for name, parameter in model.named_parameters() if not parameter.requires_grad]
-    unexpected_frozen = [name for name in frozen_names if not name.startswith(frozen_prefixes)]
-    if unexpected_frozen:
-        raise AssertionError(f"non-backbone parameters are frozen: {unexpected_frozen}")
-    required_trainable_prefixes = (
-        "model.text_encoder.text_projection.",
-        "model.vision_projection.",
-        "model.depth_encoder.token_projection.",
-        "model.depth_encoder.token_norm.",
-        "model.depth_fusion.",
-        "model.vision_language_interaction.",
-        "model.action_head.state_projection.",
-        "model.action_head.decoder.",
-    )
-    for prefix in required_trainable_prefixes:
-        if not any(name.startswith(prefix) for name in trainable_names):
-            raise AssertionError(f"expected trainable module is missing: {prefix}")
-    if not any(name.startswith("model.depth_encoder.") for name in trainable_names):
-        raise AssertionError("DINOv3DepthEncoder has no trainable parameters")
-    if not any(name.startswith("model.depth_fusion.") for name in trainable_names):
-        raise AssertionError("GatedDepthCrossAttention has no trainable parameters")
+    allowed_trainable = {
+        name
+        for name, parameter in model.named_parameters()
+        if name.startswith("model.depth_fusion.cross_attention.")
+        or name == "model.depth_fusion.depth_gate"
+        or name.startswith("model.depth_fusion.depth_norm.")
+    }
+    if set(trainable_names) != allowed_trainable:
+        raise AssertionError(
+            "Stage 2 trainable allowlist mismatch: "
+            f"unexpected={sorted(set(trainable_names) - allowed_trainable)[:10]}, "
+            f"missing={sorted(allowed_trainable - set(trainable_names))[:10]}"
+        )
 
     device = torch.device(args.device)
     model.to(device)
     model.train()
-    model.depth_fusion.set_gate_override(0.15)
+    model.depth_fusion.set_gate_override(None)
     frozen_before = _parameter_hashes(model, trainable=False)
     trainable_before = _parameter_hashes(model, trainable=True)
 
@@ -190,26 +182,39 @@ def main() -> None:
         gate_grad = _parameter_grad_l1(model.depth_fusion.depth_gate)
         encoder_grad = _grad_l1(model.depth_encoder)
         attention_grad = _grad_l1(model.depth_fusion.cross_attention)
-        if gate_grad != 0.0:
-            raise AssertionError(f"fixed depth gate unexpectedly received a gradient at step {step}")
-        if attention_grad <= 0.0:
-            raise AssertionError(f"step {step} did not update the depth cross-attention")
-        if step >= 2 and encoder_grad <= 0.0:
+        depth_norm_grad = _grad_l1(model.depth_fusion.depth_norm)
+        if gate_grad <= 0.0:
+            raise AssertionError(f"step {step} did not update the trainable depth gate")
+        if step == 1:
+            if attention_grad != 0.0 or depth_norm_grad != 0.0:
+                raise AssertionError(
+                    "zero-initialized gate should block fusion-parameter gradients at step 1: "
+                    f"cross_attention={attention_grad}, depth_norm={depth_norm_grad}"
+                )
+        elif attention_grad <= 0.0 or depth_norm_grad <= 0.0:
             raise AssertionError(
-                "the depth encoder must receive gradients after the zero-initialized output projection "
-                f"has taken one optimizer step: step={step}, encoder={encoder_grad}"
+                f"step {step} did not update the trainable fusion modules: "
+                f"cross_attention={attention_grad}, depth_norm={depth_norm_grad}"
             )
+        if encoder_grad != 0.0:
+            raise AssertionError(f"frozen depth encoder unexpectedly received gradients: {encoder_grad}")
 
         residual_ratio = model.depth_fusion.residual_ratio()
         residual_ratio_mean = (
             residual_ratio.detach().float().mean().item() if residual_ratio is not None else None
         )
-        effective_gate = model.depth_fusion.effective_gate().detach().float().abs().mean().item()
-        if abs(effective_gate - 0.15) > 1e-6:
-            raise AssertionError(f"expected fixed gate 0.15, got {effective_gate}")
-        if step >= 2 and (residual_ratio_mean is None or residual_ratio_mean <= 0.0):
+        valid_ratio = model.depth_fusion.residual_ratio_valid()
+        valid_ratio_mean = (
+            valid_ratio.detach().float().mean().item() if valid_ratio is not None and valid_ratio.numel() else None
+        )
+        effective_gate_tensor = model.depth_fusion.effective_gate().detach().float()
+        effective_gate = effective_gate_tensor.abs().mean().item()
+        effective_gate_rms = effective_gate_tensor.square().mean().sqrt().item()
+        if not 0.0 <= effective_gate <= 1.0:
+            raise AssertionError(f"effective gate left tanh bounds: {effective_gate}")
+        if step >= 2 and (valid_ratio_mean is None or valid_ratio_mean <= 0.0):
             raise AssertionError(
-                f"depth residual must become nonzero by step 2, got {residual_ratio_mean}"
+                f"valid depth residual must become nonzero by step 2, got {valid_ratio_mean}"
             )
 
         optimizer.step()
@@ -223,8 +228,11 @@ def main() -> None:
                 "gate_grad_l1": gate_grad,
                 "encoder_grad_l1": encoder_grad,
                 "cross_attention_grad_l1": attention_grad,
-                "depth_residual_ratio_mean": residual_ratio_mean,
+                "depth_norm_grad_l1": depth_norm_grad,
+                "depth_residual_ratio_allviews_mean": residual_ratio_mean,
+                "depth_residual_ratio_valid_mean": valid_ratio_mean,
                 "effective_gate_abs_mean": effective_gate,
+                "effective_gate_rms": effective_gate_rms,
             }
         )
 

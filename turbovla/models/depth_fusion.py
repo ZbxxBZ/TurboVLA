@@ -6,13 +6,17 @@ from torch import nn
 from .configuration import DepthFusionConfig
 
 
+_RATIO_WINDOW_MAX = 64
+
+
 class _DepthGateMixin:
     config: DepthFusionConfig
     depth_gate: nn.Parameter
 
     def _init_depth_gate(self, config: DepthFusionConfig) -> None:
         self._gate_override: float | None = None
-        self._last_residual_ratio: torch.Tensor | None = None
+        self._residual_ratio_values: list[torch.Tensor] = []
+        self._residual_ratio_valid_values: list[torch.Tensor] = []
         if config.gate_parameterization == "bounded_sigmoid":
             ratio = (config.gate_init - config.gate_min) / (config.gate_max - config.gate_min)
             raw_init = torch.logit(torch.tensor(ratio, dtype=torch.float32)).item()
@@ -30,7 +34,23 @@ class _DepthGateMixin:
                     f"gate override {value} is outside "
                     f"[{self.config.gate_min}, {self.config.gate_max}]"
                 )
+            if self.config.gate_parameterization == "tanh" and not -1.0 <= value <= 1.0:
+                raise ValueError(f"gate override {value} is outside [-1.0, 1.0]")
         self._gate_override = value
+
+    def _match_residual_scale(self, rgb: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """Match residual RMS to RGB RMS before applying the gate."""
+        if not self.config.residual_scale_match:
+            return delta
+        rgb_rms = rgb.detach().float().square().mean(dim=-1, keepdim=True).sqrt()
+        delta_rms = delta.detach().float().square().mean(dim=-1, keepdim=True).sqrt()
+        # Keep zero residuals zero, including all-invalid views.
+        scale = torch.where(
+            delta_rms > 1e-6,
+            rgb_rms / delta_rms.clamp_min(1e-6),
+            torch.zeros_like(rgb_rms),
+        )
+        return delta * scale.to(dtype=delta.dtype)
 
     def effective_gate(self) -> torch.Tensor:
         if self._gate_override is not None:
@@ -41,23 +61,49 @@ class _DepthGateMixin:
         return torch.tanh(self.depth_gate)
 
     def residual_ratio(self) -> torch.Tensor | None:
-        """Return the latest per-view RMS(g * delta) / RMS(rgb) values."""
-        return self._last_residual_ratio
+        """Return the fixed-size residual-ratio window since the last reset."""
+        if not self._residual_ratio_values:
+            return None
+        return torch.cat(self._residual_ratio_values, dim=0)
+
+    def reset_residual_ratio(self) -> None:
+        self._residual_ratio_values.clear()
+        self._residual_ratio_valid_values.clear()
+
+    def residual_ratio_valid(self) -> torch.Tensor | None:
+        if not self._residual_ratio_valid_values:
+            return None
+        return torch.cat(self._residual_ratio_valid_values, dim=0)
 
     def _record_residual_ratio(
         self,
         rgb_tokens: torch.Tensor,
         residual: torch.Tensor,
+        valid_view_mask: torch.Tensor | None = None,
     ) -> None:
         with torch.no_grad():
             reduce_dims = tuple(range(2, rgb_tokens.ndim))
             rgb_rms = rgb_tokens.detach().float().square().mean(dim=reduce_dims).sqrt()
             residual_rms = residual.detach().float().square().mean(dim=reduce_dims).sqrt()
-            self._last_residual_ratio = (residual_rms / rgb_rms.clamp_min(1e-6)).flatten()
+            ratio = (residual_rms / rgb_rms.clamp_min(1e-6)).flatten()
+            self._residual_ratio_values.append(ratio)
+            if valid_view_mask is None:
+                self._residual_ratio_valid_values.append(ratio)
+            else:
+                valid_view_mask = valid_view_mask.to(device=ratio.device, dtype=torch.bool).flatten()
+                if valid_view_mask.shape != ratio.shape:
+                    raise ValueError(
+                        f"valid_view_mask must have shape {tuple(ratio.shape)}, "
+                        f"got {tuple(valid_view_mask.shape)}"
+                    )
+                self._residual_ratio_valid_values.append(ratio[valid_view_mask])
+            if len(self._residual_ratio_values) > _RATIO_WINDOW_MAX:
+                self._residual_ratio_values.pop(0)
+                self._residual_ratio_valid_values.pop(0)
 
 
 class GatedAlignedDepthFusion(_DepthGateMixin, nn.Module):
-    """把每个深度 token 只注入同索引的 RGB token。"""
+    """Inject each depth token into its aligned RGB token."""
 
     def __init__(self, config: DepthFusionConfig) -> None:
         super().__init__()
@@ -77,40 +123,33 @@ class GatedAlignedDepthFusion(_DepthGateMixin, nn.Module):
             raise ValueError("rgb_tokens and depth_tokens must be [B,V,N,D]")
         if rgb_tokens.shape != depth_tokens.shape:
             raise ValueError(
-                f"RGB/depth token shapes must match, got {tuple(rgb_tokens.shape)} and {tuple(depth_tokens.shape)}"
+                f"RGB/depth token shapes must match, got {tuple(rgb_tokens.shape)} "
+                f"and {tuple(depth_tokens.shape)}"
             )
-
         batch_size, num_views, num_tokens, hidden_dim = rgb_tokens.shape
         if hidden_dim != self.config.hidden_dim:
-            raise ValueError(
-                f"expected token hidden dim {self.config.hidden_dim}, got {hidden_dim}"
-            )
+            raise ValueError(f"expected token hidden dim {self.config.hidden_dim}, got {hidden_dim}")
 
         aligned_depth = depth_tokens.to(device=rgb_tokens.device, dtype=rgb_tokens.dtype)
-        local_delta = self.local_projection(self.depth_norm(aligned_depth))
-        local_delta = self.delta_dropout(local_delta)
-
+        local_delta = self.delta_dropout(self.local_projection(self.depth_norm(aligned_depth)))
+        valid_views = None
         if depth_invalid_mask is not None:
-            expected_mask_shape = (batch_size, num_views, num_tokens)
-            if tuple(depth_invalid_mask.shape) != expected_mask_shape:
-                raise ValueError(
-                    f"depth_invalid_mask must be {expected_mask_shape}, got {tuple(depth_invalid_mask.shape)}"
-                )
+            expected = (batch_size, num_views, num_tokens)
+            if tuple(depth_invalid_mask.shape) != expected:
+                raise ValueError(f"depth_invalid_mask must be {expected}, got {tuple(depth_invalid_mask.shape)}")
             invalid_mask = depth_invalid_mask.to(device=rgb_tokens.device, dtype=torch.bool)
-            # 在线性层之后清零，避免 local_projection.bias 从无效 token 泄漏到 RGB。
             local_delta = local_delta.masked_fill(invalid_mask[..., None], 0.0)
+            valid_views = ~invalid_mask.all(dim=-1)
 
+        local_delta = self._match_residual_scale(rgb_tokens, local_delta)
         gate = self.effective_gate().to(device=local_delta.device, dtype=local_delta.dtype)
         residual = gate.view(1, 1, 1, -1) * local_delta
-        self._record_residual_ratio(rgb_tokens, residual)
+        self._record_residual_ratio(rgb_tokens, residual, valid_view_mask=valid_views)
         return rgb_tokens + residual
 
 
-# rgb_tokens:         [B, V, N, D]
-# depth_tokens:       [B, V, N, D]
-# depth_invalid_mask: [B, V, N]
 class GatedDepthCrossAttention(_DepthGateMixin, nn.Module):
-    """以 RGB token 为 Query、真实深度 token 为 Key/Value 的门控交叉注意力。"""
+    """Use RGB tokens as queries and depth tokens as keys/values."""
 
     def __init__(self, config: DepthFusionConfig) -> None:
         super().__init__()
@@ -124,13 +163,12 @@ class GatedDepthCrossAttention(_DepthGateMixin, nn.Module):
             batch_first=True,
         )
         if config.zero_init_output:
+            # Do not combine zero output initialization with gate_init=0 or
+            # residual_scale_match: both choices remove every gradient path.
             nn.init.zeros_(self.cross_attention.out_proj.weight)
             if self.cross_attention.out_proj.bias is not None:
                 nn.init.zeros_(self.cross_attention.out_proj.bias)
         self.delta_dropout = nn.Dropout(config.dropout)
-
-        # 门控参数
-        # 逐通道 gate 从 0 开始，首次加载旧 RGB checkpoint 时新分支不会改变原模型输出。
         self._init_depth_gate(config)
 
     def forward(
@@ -143,76 +181,73 @@ class GatedDepthCrossAttention(_DepthGateMixin, nn.Module):
             raise ValueError("rgb_tokens and depth_tokens must be [B,V,N,D]")
         if rgb_tokens.shape != depth_tokens.shape:
             raise ValueError(
-                f"RGB/depth token shapes must match, got {tuple(rgb_tokens.shape)} and {tuple(depth_tokens.shape)}"
+                f"RGB/depth token shapes must match, got {tuple(rgb_tokens.shape)} "
+                f"and {tuple(depth_tokens.shape)}"
             )
-
         batch_size, num_views, num_tokens, hidden_dim = rgb_tokens.shape
         if hidden_dim != self.config.hidden_dim:
-            raise ValueError(
-                f"expected token hidden dim {self.config.hidden_dim}, got {hidden_dim}"
-            )
-        flat_rgb = rgb_tokens.reshape(
-            batch_size * num_views,
-            num_tokens,
-            hidden_dim
-        )  # [B,V,N,D] → [B×V,N,D]
-
-        # 融合模块自身统一设备和精度，避免单独调用时 depth/mask 仍在 CPU 导致注意力报错。
-        flat_depth = depth_tokens.reshape(batch_size * num_views, num_tokens, hidden_dim).to(
-            device=flat_rgb.device,
-            dtype=flat_rgb.dtype,
-        )
+            raise ValueError(f"expected token hidden dim {self.config.hidden_dim}, got {hidden_dim}")
 
         if depth_invalid_mask is None:
-            key_padding_mask = torch.zeros(
-                batch_size * num_views,
-                num_tokens,
-                dtype=torch.bool,
-                device=rgb_tokens.device,
+            flat_rgb = rgb_tokens.reshape(batch_size * num_views, num_tokens, hidden_dim)
+            flat_depth = depth_tokens.reshape(batch_size * num_views, num_tokens, hidden_dim).to(
+                device=flat_rgb.device, dtype=flat_rgb.dtype
             )
+            normalized_depth = self.depth_norm(flat_depth)
+            delta, _ = self.cross_attention(
+                query=self.rgb_norm(flat_rgb),
+                key=normalized_depth,
+                value=normalized_depth,
+                need_weights=False,
+            )
+            delta = delta.reshape(batch_size, num_views, num_tokens, hidden_dim)
+            valid_view_mask = None
         else:
-            expected_mask_shape = (batch_size, num_views, num_tokens)
-            if tuple(depth_invalid_mask.shape) != expected_mask_shape:
-                raise ValueError(
-                    f"depth_invalid_mask must be {expected_mask_shape}, got {tuple(depth_invalid_mask.shape)}"
-                )
-            key_padding_mask = depth_invalid_mask.to(
-                device=rgb_tokens.device,
-                dtype=torch.bool,
-            ).reshape(batch_size * num_views, num_tokens).clone()
+            expected = (batch_size, num_views, num_tokens)
+            if tuple(depth_invalid_mask.shape) != expected:
+                raise ValueError(f"depth_invalid_mask must be {expected}, got {tuple(depth_invalid_mask.shape)}")
+            view_mask = depth_invalid_mask.to(device=rgb_tokens.device, dtype=torch.bool)
+            active_view = int(self.config.active_view_index)
+            if not 0 <= active_view < num_views:
+                raise ValueError(f"active_view_index {active_view} is outside num_views={num_views}")
 
-        # PyTorch MHA 在一整行 K/V 都被 mask 时会产生 NaN；临时放开一个零 token，随后再把该行残差清零。
-        all_invalid = key_padding_mask.all(dim=1)
-        # 全程使用张量操作，避免 all_invalid.any() 触发每次推理的 GPU-CPU 同步。
-        flat_depth = flat_depth.clone()
-        flat_depth[:, 0] = torch.where(  # 如果这一行全部无效，就把第一个 token 置零，否则保留原来的第一个 token。
-            all_invalid[:, None],
-            torch.zeros_like(flat_depth[:, 0]),
-            flat_depth[:, 0],
-        )
-        # 对于普通行，第一个 mask 保持不变；对于全无效行，把第一个 mask 临时改为 False
-        key_padding_mask[:, 0] = key_padding_mask[:, 0] & ~all_invalid
+            # The current encoder emits depth for a fixed cam_head view. This
+            # static selection avoids dynamic index construction and CUDA sync.
+            view_rgb = rgb_tokens[:, active_view]
+            view_depth = depth_tokens[:, active_view].to(
+                device=rgb_tokens.device, dtype=rgb_tokens.dtype
+            )
+            active_mask = view_mask[:, active_view]
+            all_invalid = active_mask.all(dim=1)
 
-        normalized_depth = self.depth_norm(flat_depth)
+            # PyTorch MHA returns NaN when every key is masked. Temporarily
+            # unmask the first key for those rows, then discard their residual
+            # below. Its value is irrelevant because output is cleared; this
+            # avoids cloning the complete depth tensor/key mask.
+            first_mask = active_mask[:, :1] & ~all_invalid[:, None]
+            active_mask = torch.cat((first_mask, active_mask[:, 1:]), dim=1)
+            normalized_depth = self.depth_norm(view_depth)
+            active_delta, _ = self.cross_attention(
+                query=self.rgb_norm(view_rgb),
+                key=normalized_depth,
+                value=normalized_depth,
+                key_padding_mask=active_mask,
+                need_weights=False,
+            )
+            active_delta = active_delta.masked_fill(all_invalid[:, None, None], 0.0)
+            zero_delta = torch.zeros_like(active_delta)
+            delta = torch.stack(
+                [active_delta if view == active_view else zero_delta for view in range(num_views)],
+                dim=1,
+            )
+            valid_view_mask = torch.zeros(
+                batch_size, num_views, dtype=torch.bool, device=rgb_tokens.device
+            )
+            valid_view_mask[:, active_view] = ~all_invalid
 
-        delta, _ = self.cross_attention(
-            query=self.rgb_norm(flat_rgb),
-            key=normalized_depth,
-            value=normalized_depth,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-
-        # 把整个全无效视角的 delta 清零
         delta = self.delta_dropout(delta)
-        delta = delta.masked_fill(all_invalid[:, None, None], 0.0)
-
-        # tanh 限制深度修正幅度；gate=0 时结果逐元素严格等于原 RGB token。
+        delta = self._match_residual_scale(rgb_tokens, delta)
         gate = self.effective_gate().to(device=delta.device, dtype=delta.dtype)
-        residual = gate.view(1, 1, -1) * delta
-        self._record_residual_ratio(
-            flat_rgb.view(batch_size, num_views, num_tokens, hidden_dim),
-            residual.view(batch_size, num_views, num_tokens, hidden_dim),
-        )
-        fused = flat_rgb + residual
-        return fused.view(batch_size, num_views, num_tokens, hidden_dim) # [B×V,N,D] -> [B,V,N,D]
+        residual = gate.view(1, 1, 1, -1) * delta
+        self._record_residual_ratio(rgb_tokens, residual, valid_view_mask=valid_view_mask)
+        return rgb_tokens + residual

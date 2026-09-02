@@ -23,23 +23,20 @@ export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1000}"
 
 config_yaml="${CONFIG_YAML:-experiments/robotwin/configs/clean50_depth.yaml}"
 run_root_dir="${RUN_ROOT_DIR:-results/Checkpoints}"
-run_id="${RUN_ID:-turbovla_robotwin_clean50_360_depth_gate015_8ep_bs16}"
+run_id="${RUN_ID:-turbovla_robotwin_clean50_360_depth_stage2_tanh0_scale_match}"
 launcher_python="${STARVLA_PYTHON:-python}"
 num_processes="${NUM_PROCESSES:-1}"
 main_process_port="${MAIN_PROCESS_PORT:-29630}"
-per_device_batch_size="${PER_DEVICE_BATCH_SIZE:-4}"
-gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS:-4}"
+per_device_batch_size="${PER_DEVICE_BATCH_SIZE:-16}"
+gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS:-1}"
 # 65,515 frames / effective batch 16 = about 4,095 optimizer steps per epoch.
 max_train_steps="${MAX_TRAIN_STEPS:-32760}"
 warmup_steps="${WARMUP_STEPS:-1000}"
 save_interval="${SAVE_INTERVAL:-4095}"
 logging_frequency="${LOGGING_FREQUENCY:-50}"
 learning_rate="${LEARNING_RATE:-5.0e-05}"
-# 深度编码器和融合层从随机初始化开始，允许用独立且稍大的学习率。
-depth_projection_learning_rate="${DEPTH_PROJECTION_LEARNING_RATE:-1.0e-05}"
+# Stage two trains cross-attention, the gate, and depth-token normalization.
 depth_fusion_learning_rate="${DEPTH_FUSION_LEARNING_RATE:-1.0e-04}"
-interaction_learning_rate="${INTERACTION_LEARNING_RATE:-5.0e-06}"
-action_decoder_learning_rate="${ACTION_DECODER_LEARNING_RATE:-1.0e-05}"
 ema_decay="${EMA_DECAY:-0.999}"
 ema_device="${EMA_DEVICE:-cuda}"
 output_dir="${run_root_dir}/${run_id}"
@@ -65,7 +62,7 @@ echo "[INFO] data_root=${ROBOTWIN_DATA_ROOT}"
 echo "[INFO] output_dir=${output_dir}"
 echo "[INFO] processes=${num_processes} per_device_bs=${per_device_batch_size} grad_accum=${gradient_accumulation_steps}"
 echo "[INFO] global_batch=$((num_processes * per_device_batch_size * gradient_accumulation_steps))"
-echo "[INFO] base_lr=${learning_rate} depth_projection_lr=${depth_projection_learning_rate} depth_fusion_lr=${depth_fusion_learning_rate} interaction_lr=${interaction_learning_rate} action_decoder_lr=${action_decoder_learning_rate}"
+echo "[INFO] base_lr=${learning_rate} depth_fusion_lr=${depth_fusion_learning_rate}"
 echo "[INFO] warmup=${warmup_steps} ema_decay=${ema_decay}"
 
 mkdir -p "${output_dir}"
@@ -80,10 +77,7 @@ cp third_party/starvla_runtime/starVLA/training/train_robotwin_clean_act_pi05_re
   --config_yaml "${config_yaml}" \
   --datasets.vla_data.per_device_batch_size "${per_device_batch_size}" \
   --trainer.learning_rate.base "${learning_rate}" \
-  --trainer.learning_rate.depth_encoder "${depth_projection_learning_rate}" \
   --trainer.learning_rate.depth_fusion "${depth_fusion_learning_rate}" \
-  --trainer.learning_rate.vision_language_interaction "${interaction_learning_rate}" \
-  --trainer.learning_rate.action_head "${action_decoder_learning_rate}" \
   --trainer.gradient_accumulation_steps "${gradient_accumulation_steps}" \
   --trainer.ema_decay "${ema_decay}" \
   --trainer.ema_device "${ema_device}" \

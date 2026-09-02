@@ -71,6 +71,8 @@ class TurboVLADefaultConfig:
             "projection_weights_path": "",
             "adapter_weights_path": "",
             "feature_dim": 160,
+            "dpt_feature_dim": 256,
+            "stage1_mode": "legacy_patch",
             "freeze_backbone": True,
             "freeze_depth_head": True,
             "freeze_depth_encoder": False,
@@ -99,6 +101,8 @@ class TurboVLADefaultConfig:
             "gate_parameterization": "tanh",
             "gate_min": 0.0,
             "gate_max": 1.0,
+            "residual_scale_match": True,
+            "active_view_index": 0,
             "zero_init_output": False,
         }
     )
@@ -212,6 +216,8 @@ class TurboVLAFramework(baseframework):
                 projection_weights_path=str(fw.depth.projection_weights_path),
                 adapter_weights_path=str(fw.depth.adapter_weights_path),
                 feature_dim=int(fw.depth.feature_dim),
+                dpt_feature_dim=int(fw.depth.get("dpt_feature_dim", 256)),
+                stage1_mode=str(fw.depth.get("stage1_mode", "legacy_patch")),
                 freeze_backbone=bool(fw.depth.freeze_backbone),
                 freeze_depth_head=bool(fw.depth.freeze_depth_head),
                 frozen=bool(fw.depth.freeze_depth_encoder),
@@ -238,6 +244,8 @@ class TurboVLAFramework(baseframework):
                 gate_parameterization=str(fw.depth_fusion.gate_parameterization),
                 gate_min=float(fw.depth_fusion.gate_min),
                 gate_max=float(fw.depth_fusion.gate_max),
+                residual_scale_match=bool(fw.depth_fusion.get("residual_scale_match", True)),
+                active_view_index=int(fw.depth_fusion.get("active_view_index", fw.depth.head_camera_index)),
                 zero_init_output=bool(fw.depth_fusion.zero_init_output),
             ),
             interaction=InteractionConfig(

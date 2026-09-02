@@ -5,9 +5,11 @@ import h5py
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from PIL import Image
 
 from scripts.robotwin.attach_depth_to_lerobot import _augment_parquet
+from scripts.robotwin.train_depth_dinov3 import RoboTwinHeadRGBD, episode_paths, task_name
 from starVLA.dataloader.gr00t_lerobot.depth_io import decode_depth_entry
 
 
@@ -84,3 +86,31 @@ def test_attach_depth_rejects_mismatched_rgb_trajectory(tmp_path):
 
     with pytest.raises(ValueError, match="RGB/depth trajectory mismatch"):
         _augment_parquet(parquet_path, raw_dir)
+
+
+def test_stage_one_reads_embedded_lerobot_rgbd(tmp_path):
+    task_root = tmp_path / "Clean" / "click_alarmclock"
+    parquet_dir = task_root / "data" / "chunk-000"
+    parquet_dir.mkdir(parents=True)
+
+    rgb_buffer = io.BytesIO()
+    Image.fromarray(np.full((6, 8, 3), (64, 128, 192), dtype=np.uint8)).save(rgb_buffer, format="JPEG")
+    depth_buffer = io.BytesIO()
+    Image.fromarray(np.full((6, 8), 1250, dtype=np.uint16)).save(depth_buffer, format="PNG")
+    parquet_path = parquet_dir / "episode_000000.parquet"
+    pd.DataFrame(
+        {
+            "observation.images.cam_high": [{"bytes": rgb_buffer.getvalue(), "path": None}],
+            "observation.depths.cam_high": [{"bytes": depth_buffer.getvalue(), "path": None}],
+        }
+    ).to_parquet(parquet_path, index=False)
+
+    paths = episode_paths(tmp_path)
+    dataset = RoboTwinHeadRGBD(paths, image_size=4, frame_stride=1, augment=False)
+    rgb, depth = dataset[0]
+
+    assert paths == [parquet_path]
+    assert task_name(parquet_path) == "click_alarmclock"
+    assert rgb.shape == (3, 4, 4)
+    assert depth.shape == (1, 4, 4)
+    assert torch.allclose(depth, torch.full_like(depth, 1.25))

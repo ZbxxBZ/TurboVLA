@@ -1,4 +1,4 @@
-run_id: turbovla_robotwin_clean50_360_depth_stage2_tanh0_scale_match
+run_id: turbovla_robotwin_clean50_360_depth_stage2_tanh0_scale_match_acthead
 run_root_dir: results/Checkpoints
 seed: 42
 wandb_entity: your_wandb_entity
@@ -144,14 +144,15 @@ trainer:
     base: 5.0e-05
     # 深度模块使用较大学习率；预训练交互层和完整动作头使用较小学习率适应深度特征。
     depth_fusion: 1.0e-04
+    action_head: 1.0e-05
   lr_scheduler_type: warmup_constant_with_factor
   scheduler_specific_kwargs:
     warmup_start_factor: 0.0
   # The allowlist below freezes RGB DINOv3, BERT, VGGT, the Stage 1 adapter,
-  # VLI, and ACT. Only the listed depth-fusion parameters are trainable.
+  # VLI remains frozen; ACT action_head is trainable in this variant.
   freeze_modules: ""
-  # Strict Stage 2 allowlist: train cross-attention, gate, and depth norm.
-  train_modules: depth_fusion.cross_attention,depth_fusion.depth_gate,depth_fusion.depth_norm
+  # Stage 2 + ACT variant: train cross-attention, gate, depth norm, and ACT.
+  train_modules: depth_fusion.cross_attention,depth_fusion.depth_gate,depth_fusion.depth_norm,action_head
   max_grad_norm: 1.0
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1

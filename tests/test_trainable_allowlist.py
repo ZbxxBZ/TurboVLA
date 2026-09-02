@@ -29,7 +29,7 @@ class _Model(nn.Module):
 
 def test_stage2_allowlist_accepts_module_and_parameter_paths() -> None:
     model = _Model()
-    paths = ["depth_fusion.cross_attention", "depth_fusion.depth_gate"]
+    paths = ["depth_fusion.cross_attention", "depth_fusion.depth_gate", "depth_fusion.depth_norm"]
 
     selected_ids = _parameter_ids_for_module_paths(model, paths, "train_modules")
     TrainerUtils.freeze_backbones(model, train_modules=",".join(paths))
@@ -44,5 +44,5 @@ def test_stage2_allowlist_accepts_module_and_parameter_paths() -> None:
     }
     assert trainable == expected
     assert trainable
-    assert not any("rgb_norm" in name or "depth_norm" in name for name in trainable)
-
+    assert not any("rgb_norm" in name for name in trainable)
+    assert any("depth_norm" in name for name in trainable)

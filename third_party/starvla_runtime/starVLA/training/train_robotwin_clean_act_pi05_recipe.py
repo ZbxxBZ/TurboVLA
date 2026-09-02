@@ -12,69 +12,14 @@ from starVLA.training import train_starvla as base_train
 from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 
 
-def linear_gate_warmup_value(
-    step: int,
-    warmup_steps: int,
-    start: float,
-    end: float,
-) -> float | None:
-    if warmup_steps <= 0 or step >= warmup_steps:
-        return None
-    if warmup_steps == 1:
-        return float(end)
-    fraction = max(0, step) / (warmup_steps - 1)
-    return float(start + (end - start) * fraction)
-
-
 class EMAVLATrainer(base_train.VLATrainer):
     def prepare_training(self):
         super().prepare_training()
-        self._init_depth_gate_schedule()
         self._init_ema()
 
     def _depth_fusion(self):
         module = self.accelerator.unwrap_model(self.model)
         return getattr(module, "depth_fusion", None)
-
-    def _init_depth_gate_schedule(self):
-        self.depth_gate_warmup_steps = int(
-            getattr(self.config.trainer, "depth_gate_warmup_steps", 0) or 0
-        )
-        self.depth_gate_warmup_start = float(
-            getattr(self.config.trainer, "depth_gate_warmup_start", 0.02)
-        )
-        self.depth_gate_warmup_end = float(
-            getattr(self.config.trainer, "depth_gate_warmup_end", 0.08)
-        )
-        if self.depth_gate_warmup_steps < 0:
-            raise ValueError("trainer.depth_gate_warmup_steps must be non-negative")
-
-        fusion = self._depth_fusion()
-        if self.depth_gate_warmup_steps and (
-            fusion is None or not callable(getattr(fusion, "set_gate_override", None))
-        ):
-            raise ValueError("depth gate warmup requires a depth fusion module")
-        self._apply_depth_gate_schedule()
-        if self.accelerator.is_main_process:
-            base_train.logger.info(
-                "Depth gate schedule: steps=%d, start=%.6f, end=%.6f",
-                self.depth_gate_warmup_steps,
-                self.depth_gate_warmup_start,
-                self.depth_gate_warmup_end,
-            )
-
-    def _apply_depth_gate_schedule(self):
-        fusion = self._depth_fusion()
-        if fusion is None or not callable(getattr(fusion, "set_gate_override", None)):
-            return None
-        value = linear_gate_warmup_value(
-            self.completed_steps,
-            self.depth_gate_warmup_steps,
-            self.depth_gate_warmup_start,
-            self.depth_gate_warmup_end,
-        )
-        fusion.set_gate_override(value)
-        return value
 
     def _depth_gate_metrics(self):
         fusion = self._depth_fusion()
@@ -84,17 +29,34 @@ class EMAVLATrainer(base_train.VLATrainer):
         metrics = {
             "depth_gate_mean": gate.mean().item(),
             "depth_gate_abs_mean": gate.abs().mean().item(),
+            "depth_gate_rms": gate.square().mean().sqrt().item(),
+            "depth_gate_p50": gate.median().item(),
             "depth_gate_min": gate.min().item(),
             "depth_gate_max": gate.max().item(),
         }
+        # Keep an all-view diagnostic and a valid-view statistic that is not
+        # diluted by the intentionally masked wrist rows.
         residual_ratio = fusion.residual_ratio()
         if residual_ratio is not None and residual_ratio.numel() > 0:
             residual_ratio = residual_ratio.detach().float()
             metrics.update(
                 {
-                    "depth_residual_ratio_mean": residual_ratio.mean().item(),
-                    "depth_residual_ratio_p50": torch.quantile(residual_ratio, 0.50).item(),
-                    "depth_residual_ratio_p95": torch.quantile(residual_ratio, 0.95).item(),
+                    "depth_residual_ratio_allviews_mean": residual_ratio.mean().item(),
+                    "depth_residual_ratio_allviews_p50": torch.quantile(residual_ratio, 0.50).item(),
+                    "depth_residual_ratio_allviews_p95": torch.quantile(residual_ratio, 0.95).item(),
+                    "depth_residual_ratio_allviews_max": residual_ratio.max().item(),
+                }
+            )
+        valid_ratio_fn = getattr(fusion, "residual_ratio_valid", None)
+        valid_ratio = valid_ratio_fn() if callable(valid_ratio_fn) else residual_ratio
+        if valid_ratio is not None and valid_ratio.numel() > 0:
+            valid_ratio = valid_ratio.detach().float()
+            metrics.update(
+                {
+                    "depth_residual_ratio_valid_mean": valid_ratio.mean().item(),
+                    "depth_residual_ratio_valid_p50": torch.quantile(valid_ratio, 0.50).item(),
+                    "depth_residual_ratio_valid_p95": torch.quantile(valid_ratio, 0.95).item(),
+                    "depth_residual_ratio_valid_max": valid_ratio.max().item(),
                 }
             )
         return metrics
@@ -139,16 +101,20 @@ class EMAVLATrainer(base_train.VLATrainer):
                 shadow.mul_(decay).add_(current, alpha=1.0 - decay)
 
     def _train_step(self, batch_vla, batch_vlm=None):
-        gate_override = self._apply_depth_gate_schedule()
         metrics = super()._train_step(batch_vla, batch_vlm=batch_vlm)
         if self.accelerator.sync_gradients:
             self._update_ema()
             next_step = self.completed_steps + 1
             log_frequency = int(self.config.trainer.logging_frequency)
             if next_step % log_frequency == 0:
+                # ``residual_ratio`` is accumulated by the fusion module
+                # across all micro-batches in this optimizer update.  Read it
+                # only on logging steps; the window is reset below every
+                # optimizer update so later logs cannot mix old updates.
                 metrics.update(self._depth_gate_metrics())
-                if gate_override is not None:
-                    metrics["depth_gate_override"] = gate_override
+            fusion = self._depth_fusion()
+            if fusion is not None and callable(getattr(fusion, "reset_residual_ratio", None)):
+                fusion.reset_residual_ratio()
         return metrics
 
     def _ema_state_dict(self):

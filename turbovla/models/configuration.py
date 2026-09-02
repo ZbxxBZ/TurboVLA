@@ -45,6 +45,10 @@ class DepthEncoderConfig:
 
     enabled: bool = False
     backend: str = "dinov3"
+    # VGGT stage-1 tokenization/supervision path.  ``legacy_patch`` preserves
+    # the existing depth/confidence -> patch-mean adapter; ``dpt_dense`` uses
+    # VGGT's native DPT feature fusion and dense depth head.
+    stage1_mode: str = "legacy_patch"
     image_size: int = 224
     num_views: int = 3
     hidden_dim: int = 256
@@ -59,6 +63,7 @@ class DepthEncoderConfig:
     projection_weights_path: str = ""
     adapter_weights_path: str = ""
     feature_dim: int = 160
+    dpt_feature_dim: int = 256
     freeze_backbone: bool = True
     freeze_depth_head: bool = True
     frozen: bool = False
@@ -89,6 +94,14 @@ class DepthFusionConfig:
     gate_min: float = 0.0
     gate_max: float = 1.0
     mode: str = "global"
+    # Current RoboTwin depth encoder produces geometry for this view only.
+    # Keeping the index here lets cross-attention select it without a CUDA
+    # mask-to-index synchronization on every forward.
+    active_view_index: int = 0
+    # Match the cross-attention residual RMS to the RGB token RMS before the
+    # gate.  This makes the effective gate directly interpretable as the
+    # injected residual ratio.
+    residual_scale_match: bool = True
     zero_init_output: bool = False
 
 
@@ -139,6 +152,8 @@ class TurboVLAConfig:
             raise ValueError("depth.enabled and depth_fusion.enabled must be enabled together")
         if self.depth.backend not in {"dinov3", "vggt"}:
             raise ValueError("depth.backend must be 'dinov3' or 'vggt'")
+        if self.depth.stage1_mode not in {"legacy_patch", "dpt_dense"}:
+            raise ValueError("depth.stage1_mode must be 'legacy_patch' or 'dpt_dense'")
         # 深度关闭时不约束视角数，保证所有旧的 LIBERO/RoboTwin 配置都能原样构建。
         if self.depth.enabled and self.depth.num_views != self.vision.num_views:
             raise ValueError("depth.num_views must match vision.num_views")
@@ -146,6 +161,8 @@ class TurboVLAConfig:
             raise ValueError("depth.hidden_dim must match interaction.hidden_dim")
         if self.depth_fusion.enabled and self.depth_fusion.hidden_dim != self.interaction.hidden_dim:
             raise ValueError("depth_fusion.hidden_dim must match interaction.hidden_dim")
+        if self.depth_fusion.enabled and not 0 <= self.depth_fusion.active_view_index < self.vision.num_views:
+            raise ValueError("depth_fusion.active_view_index must identify one configured RGB view")
         if not 0.0 <= self.depth.min_valid_fraction <= 1.0:
             raise ValueError("depth.min_valid_fraction must be in [0, 1]")
         if self.depth_fusion.mode not in {"global", "aligned"}:
@@ -154,11 +171,24 @@ class TurboVLAConfig:
             raise ValueError(
                 "depth_fusion.gate_parameterization must be 'tanh' or 'bounded_sigmoid'"
             )
+        if self.depth_fusion.gate_parameterization == "tanh":
+            if not -1.0 < self.depth_fusion.gate_init < 1.0:
+                raise ValueError("tanh depth gate requires -1 < gate_init < 1")
         if self.depth_fusion.gate_parameterization == "bounded_sigmoid":
             if not 0.0 <= self.depth_fusion.gate_min < self.depth_fusion.gate_max <= 1.0:
                 raise ValueError("bounded depth gate requires 0 <= gate_min < gate_max <= 1")
             if not self.depth_fusion.gate_min < self.depth_fusion.gate_init < self.depth_fusion.gate_max:
                 raise ValueError("bounded depth gate requires gate_min < gate_init < gate_max")
+        # With residual_scale_match, a zero out_proj produces a zero delta;
+        # its detached RMS scale is also zero, so neither out_proj nor gate
+        # receives a gradient.  Reject this dead branch explicitly.
+        if self.depth_fusion.zero_init_output and (
+            self.depth_fusion.gate_init == 0.0 or self.depth_fusion.residual_scale_match
+        ):
+            raise ValueError(
+                "zero_init_output with gate_init=0 or residual_scale_match is invalid; "
+                "both remove a gradient path from the depth branch"
+            )
         if self.depth.patch_size < 1 or self.depth.image_size < 1:
             raise ValueError("depth.image_size and depth.patch_size must be positive")
         if self.depth.image_size % self.depth.patch_size != 0:
@@ -169,6 +199,17 @@ class TurboVLAConfig:
             raise ValueError("depth DINOv3 backbone dimensions must be positive")
         if self.depth.feature_dim < 1:
             raise ValueError("depth.feature_dim must be positive")
+        if self.depth.dpt_feature_dim < 1:
+            raise ValueError("depth.dpt_feature_dim must be positive")
+        if (
+            self.depth.backend == "vggt"
+            and self.depth.stage1_mode == "dpt_dense"
+            and self.depth.dpt_feature_dim != self.depth.hidden_dim
+        ):
+            raise ValueError(
+                "dpt_dense requires depth.dpt_feature_dim == depth.hidden_dim "
+                "so supervised DPT features become tokens without a learned projection"
+            )
         if self.depth.min_depth_m <= 0 or self.depth.max_depth_m <= self.depth.min_depth_m:
             raise ValueError("depth metric range is invalid")
         if self.depth.backend == "vggt":

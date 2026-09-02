@@ -345,6 +345,7 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
             depth=DepthEncoderConfig(
                 enabled=bool(_arg(args, "depth_enabled", False)),
                 backend=str(_arg(args, "depth_backend", "dinov3")),
+                stage1_mode=str(_arg(args, "depth_stage1_mode", "legacy_patch")),
                 image_size=int(_arg(args, "depth_image_size", _arg(args, "image_size", 256))),
                 num_views=int(_arg(args, "num_views", 2)),
                 hidden_dim=int(_arg(args, "hidden_dim", 256)),
@@ -359,6 +360,7 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 projection_weights_path=str(_arg(args, "depth_projection_weights_path", "")),
                 adapter_weights_path=str(_arg(args, "depth_adapter_weights_path", "")),
                 feature_dim=int(_arg(args, "depth_feature_dim", 160)),
+                dpt_feature_dim=int(_arg(args, "depth_dpt_feature_dim", 256)),
                 freeze_backbone=bool(_arg(args, "freeze_depth_backbone", True)),
                 freeze_depth_head=bool(_arg(args, "freeze_depth_head", True)),
                 frozen=bool(_arg(args, "freeze_depth_encoder", False)),
@@ -385,6 +387,9 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 gate_parameterization=str(_arg(args, "depth_gate_parameterization", "tanh")),
                 gate_min=float(_arg(args, "depth_gate_min", 0.0)),
                 gate_max=float(_arg(args, "depth_gate_max", 1.0)),
+                residual_scale_match=bool(_arg(args, "depth_residual_scale_match", True)),
+                active_view_index=int(_arg(args, "depth_head_camera_index", 0)),
+                zero_init_output=bool(_arg(args, "depth_zero_init_output", False)),
             ),
             interaction=InteractionConfig(
                 hidden_dim=int(_arg(args, "hidden_dim", 256)),

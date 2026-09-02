@@ -27,16 +27,25 @@ from turbovla.models.depth_encoder import DINOv3DepthEncoder
 
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406))[:, None, None]
 IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225))[:, None, None]
+LEROBOT_RGB_KEY = "observation.images.cam_high"
+LEROBOT_DEPTH_KEY = "observation.depths.cam_high"
 
 
 def episode_paths(dataset_root: Path) -> list[Path]:
     paths = sorted(dataset_root.glob("**/*.hdf5"))
     if not paths:
-        raise FileNotFoundError(f"no HDF5 episodes found below {dataset_root}")
+        paths = sorted(dataset_root.glob("**/data/**/*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"no HDF5 or LeRobot parquet episodes found below {dataset_root}")
     return paths
 
 
 def task_name(path: Path) -> str:
+    if path.suffix == ".parquet":
+        for parent in path.parents:
+            if parent.name == "data":
+                return parent.parent.name
+        raise ValueError(f"cannot infer LeRobot task name from {path}")
     parts = path.parts
     try:
         return parts[parts.index("demo_clean_depth_turbovla") + 1]
@@ -74,12 +83,23 @@ class RoboTwinHeadRGBD(Dataset):
         self.augment = augment
         self.open_files = open_files
         self.handles: OrderedDict[Path, h5py.File] = OrderedDict()
+        self.tables: OrderedDict[Path, object] = OrderedDict()
         self.frames: list[tuple[Path, int]] = []
         for path in paths:
-            with h5py.File(path, "r") as handle:
-                count = len(handle["vision/cam_head/colors"])
-                if len(handle["vision/cam_head/depths"]) != count:
-                    raise ValueError(f"RGB/depth length mismatch in {path}")
+            if path.suffix == ".parquet":
+                import pyarrow.parquet as pq
+
+                parquet = pq.ParquetFile(path)
+                columns = set(parquet.schema_arrow.names)
+                required = {LEROBOT_RGB_KEY, LEROBOT_DEPTH_KEY}
+                if missing := required - columns:
+                    raise KeyError(f"missing LeRobot RGB-D columns in {path}: {sorted(missing)}")
+                count = parquet.metadata.num_rows
+            else:
+                with h5py.File(path, "r") as handle:
+                    count = len(handle["vision/cam_head/colors"])
+                    if len(handle["vision/cam_head/depths"]) != count:
+                        raise ValueError(f"RGB/depth length mismatch in {path}")
             self.frames.extend((path, index) for index in range(0, count, frame_stride))
 
     def __len__(self) -> int:
@@ -95,16 +115,56 @@ class RoboTwinHeadRGBD(Dataset):
             stale.close()
         return handle
 
+    def _table(self, path: Path):
+        import pyarrow.parquet as pq
+
+        table = self.tables.pop(path, None)
+        if table is None:
+            table = pq.read_table(path, columns=[LEROBOT_RGB_KEY, LEROBOT_DEPTH_KEY])
+        self.tables[path] = table
+        while len(self.tables) > self.open_files:
+            self.tables.popitem(last=False)
+        return table
+
+    @staticmethod
+    def _entry_source(entry, parquet_path: Path):
+        if isinstance(entry, dict):
+            if entry.get("bytes") is not None:
+                return io.BytesIO(bytes(entry["bytes"]))
+            if entry.get("path") is not None:
+                relative_path = Path(entry["path"])
+                if relative_path.is_absolute():
+                    return relative_path
+                task_root = next((parent.parent for parent in parquet_path.parents if parent.name == "data"), None)
+                if task_root is None:
+                    raise ValueError(f"cannot resolve image path relative to {parquet_path}")
+                return task_root / relative_path
+            raise TypeError("LeRobot image dictionary must contain 'bytes' or 'path'")
+        if isinstance(entry, (bytes, bytearray, memoryview)):
+            return io.BytesIO(bytes(entry))
+        if isinstance(entry, (str, Path)):
+            return Path(entry)
+        raise TypeError(f"unsupported LeRobot image entry type: {type(entry)}")
+
     def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor]:
         path, frame = self.frames[item]
-        handle = self._handle(path)
-        encoded = bytes(handle["vision/cam_head/colors"][frame])
-        image = Image.open(io.BytesIO(encoded)).convert("RGB")
+        if path.suffix == ".parquet":
+            table = self._table(path)
+            rgb_source = self._entry_source(table[LEROBOT_RGB_KEY][frame].as_py(), path)
+            depth_source = self._entry_source(table[LEROBOT_DEPTH_KEY][frame].as_py(), path)
+            with Image.open(rgb_source) as encoded_image:
+                image = encoded_image.convert("RGB")
+            with Image.open(depth_source) as encoded_depth:
+                depth_array = np.asarray(encoded_depth, dtype=np.float32).copy()
+        else:
+            handle = self._handle(path)
+            encoded = bytes(handle["vision/cam_head/colors"][frame])
+            image = Image.open(io.BytesIO(encoded)).convert("RGB")
+            depth_array = np.asarray(handle["vision/cam_head/depths"][frame], dtype=np.float32).copy()
         image = image.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR)
         rgb_array = np.asarray(image, dtype=np.uint8).copy()
         rgb = torch.from_numpy(rgb_array).permute(2, 0, 1).float() / 255.0
 
-        depth_array = np.asarray(handle["vision/cam_head/depths"][frame], dtype=np.float32).copy()
         depth = torch.from_numpy(depth_array)[None] / 1000.0
         depth = F.interpolate(depth[None], (self.image_size, self.image_size), mode="nearest")[0]
         valid = torch.isfinite(depth) & (depth > 0)
