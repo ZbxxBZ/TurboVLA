@@ -2,6 +2,7 @@
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import sys
 
 import torch
 
@@ -12,6 +13,7 @@ def main() -> None:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")
     module = module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${VGGT_FEATURE_ROOT:?Set VGGT_FEATURE_ROOT to the offline native-resolution VGGT feature cache.}"
 
 export RUN_ID="${RUN_ID:-turbovla_robotwin_click_3dmix}"
+export NUM_PROCESSES="${NUM_PROCESSES:-1}"
 export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 export MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-20000}"
