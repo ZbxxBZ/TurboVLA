@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -74,6 +76,13 @@ class TurboVLADefaultConfig:
             "semantic_pool": "vl",
             "output_scale_init": 0.0,
             "feature_key": "vggt",
+            # Online VGGT is opt-in. The extractor is intentionally kept
+            # outside the nn.Module tree so its frozen weights are not saved
+            # into TurboVLA checkpoints or passed to the optimizer.
+            "online": False,
+            "vggt_model_path": "",
+            "vggt_code_path": "/mnt/vggt",
+            "vggt_input_size": 518,
         }
     )
     initialization: dict = field(
@@ -100,6 +109,69 @@ class TurboVLADefaultConfig:
     )
 
 
+class _OnlineVGGT:
+    """Lazy, frozen VGGT feature extractor for online 3D-MIX training."""
+
+    def __init__(self, model_path: str, code_path: str, input_size: int = 518) -> None:
+        self.model_path = str(model_path)
+        self.code_path = str(code_path)
+        self.input_size = int(input_size)
+        self.model = None
+        self.device = None
+
+    def _ensure_model(self) -> None:
+        if self.model is not None:
+            return
+        if not self.model_path:
+            raise ValueError(
+                "Online VGGT is enabled but framework.three_dmix.vggt_model_path is empty"
+            )
+        if self.code_path and self.code_path not in sys.path:
+            sys.path.insert(0, self.code_path)
+        from vggt.models.vggt import VGGT
+
+        model = VGGT(
+            enable_camera=False,
+            enable_point=False,
+            enable_depth=False,
+            enable_track=False,
+            feature_only=True,
+        )
+        try:
+            state = torch.load(self.model_path, map_location="cpu", weights_only=True)
+        except TypeError:  # Older torch versions do not expose weights_only.
+            state = torch.load(self.model_path, map_location="cpu")
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            raise RuntimeError(
+                f"VGGT checkpoint is missing {len(missing)} tensors; refusing online extraction"
+            )
+        print(
+            f"[TurboVLA] online VGGT loaded: {self.model_path} "
+            f"(unexpected={len(unexpected)})",
+            flush=True,
+        )
+        model.eval()
+        self.model = model
+
+    @torch.inference_mode()
+    def __call__(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 5:
+            raise ValueError(f"online VGGT images must be [B,V,3,H,W], got {tuple(images.shape)}")
+        self._ensure_model()
+        if self.device != images.device:
+            self.model.to(images.device)
+            self.device = images.device
+        precision_context = nullcontext()
+        if images.device.type == "cuda":
+            precision_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        with precision_context:
+            aggregated, patch_start = self.model.aggregator(images)
+        # Keep every native patch token and flatten the view dimension:
+        # [B,V,N_patch,2048] -> [B,V*N_patch,2048].
+        return aggregated[-1][:, :, patch_start:, :].float().flatten(1, 2)
+
+
 @FRAMEWORK_REGISTRY.register("TurboVLA")
 class TurboVLAFramework(baseframework):
     """StarVLA batch and checkpoint adapter around the shared TurboVLA model."""
@@ -120,6 +192,13 @@ class TurboVLAFramework(baseframework):
             self.image_processor.size = {"height": self.image_size, "width": self.image_size}
         self.action_horizon = int(fw.action.horizon)
         self.loss_type = str(fw.action.loss_type).lower()
+        self._online_vggt = None
+        if bool(fw.three_dmix.get("online", False)):
+            self._online_vggt = _OnlineVGGT(
+                model_path=str(fw.three_dmix.get("vggt_model_path", "")),
+                code_path=str(fw.three_dmix.get("vggt_code_path", "/mnt/vggt")),
+                input_size=int(fw.three_dmix.get("vggt_input_size", 518)),
+            )
         if fw.initialization.load_pretrained:
             self._load_initialization(fw.initialization)
 
@@ -257,6 +336,13 @@ class TurboVLAFramework(baseframework):
             views.extend([views[-1]] * (num_views - len(views)))
         return views[:num_views]
 
+    @staticmethod
+    def _vggt_image_tensor(image: Image.Image, input_size: int) -> torch.Tensor:
+        """Convert one RGB PIL view to VGGT's [3,H,W] float input."""
+        image = image.convert("RGB").resize((input_size, input_size))
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
     def _model_inputs(self, examples: List[dict]):
         if not isinstance(examples, list):
             examples = [examples]
@@ -273,23 +359,39 @@ class TurboVLAFramework(baseframework):
         )
         samples = {"dinov3": pixel_values}
         if bool(self.config.framework.three_dmix.enabled):
-            feature_key = str(self.config.framework.three_dmix.get("feature_key", "vggt"))
-            features = [
-                self._load_vggt_feature(example.get(feature_key), index)
-                for index, example in enumerate(examples)
-            ]
-            if any(feature is None for feature in features):
-                raise ValueError(
-                    "ThreeDMix is enabled but RoboTwin examples do not provide "
-                    f"{feature_key!r}. Add cached VGGT tensors to each example or configure a feature cache."
-                )
-            try:
-                samples["vggt"] = torch.stack(
-                    [feature for feature in features if feature is not None], dim=0
+            if self._online_vggt is not None:
+                vggt_images = torch.stack(
+                    [
+                        torch.stack(
+                            [
+                                self._vggt_image_tensor(view, self._online_vggt.input_size)
+                                for view in self._as_view_list(example["image"], self.num_views)
+                            ],
+                            dim=0,
+                        )
+                        for example in examples
+                    ],
+                    dim=0,
                 ).to(device)
-            except RuntimeError as exc:
-                shapes = [tuple(feature.shape) for feature in features if feature is not None]
-                raise ValueError(f"VGGT feature shapes must match across a batch, got {shapes}") from exc
+                samples["vggt"] = self._online_vggt(vggt_images)
+            else:
+                feature_key = str(self.config.framework.three_dmix.get("feature_key", "vggt"))
+                features = [
+                    self._load_vggt_feature(example.get(feature_key), index)
+                    for index, example in enumerate(examples)
+                ]
+                if any(feature is None for feature in features):
+                    raise ValueError(
+                        "ThreeDMix is enabled and online VGGT is disabled, but RoboTwin examples do not provide "
+                        f"{feature_key!r}. Add cached VGGT tensors or enable framework.three_dmix.online."
+                    )
+                try:
+                    samples["vggt"] = torch.stack(
+                        [feature for feature in features if feature is not None], dim=0
+                    ).to(device)
+                except RuntimeError as exc:
+                    shapes = [tuple(feature.shape) for feature in features if feature is not None]
+                    raise ValueError(f"VGGT feature shapes must match across a batch, got {shapes}") from exc
         return instructions, samples, states
 
     @staticmethod
@@ -298,7 +400,9 @@ class TurboVLAFramework(baseframework):
         if value is None:
             return None
         if isinstance(value, torch.Tensor):
-            feature = value.detach().cpu()
+            # Preserve device for online features; cached tensors loaded from
+            # disk are CPU tensors and follow the same path below.
+            feature = value.detach()
         elif isinstance(value, np.ndarray):
             feature = torch.from_numpy(value)
         elif isinstance(value, (str, Path)):

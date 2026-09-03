@@ -407,8 +407,6 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
@@ -420,7 +418,14 @@ class VLATrainer(TrainerUtils):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
-            self.lr_scheduler.step()
+            # The scheduler is not wrapped by Accelerator in this trainer, so
+            # advance it once per optimizer update rather than once per
+            # micro-batch inside a gradient-accumulation window.
+            if self.accelerator.sync_gradients:
+                self.lr_scheduler.step()
+            # AcceleratedOptimizer.zero_grad() is a no-op while gradients are
+            # being accumulated and clears them after the synchronized update.
+            self.optimizer.zero_grad()
 
         return {
             "action_dit_loss": action_loss.item(),
