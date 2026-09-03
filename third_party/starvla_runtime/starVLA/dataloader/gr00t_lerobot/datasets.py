@@ -1393,9 +1393,9 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, trajectory_id=trajectory_id, base_index=base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
+    def _pack_sample(self, data: dict, trajectory_id=None, base_index=None) -> dict:
         """Pack transformed modality data into training sample format."""
         step_images = []
         for video_key in self.modality_keys["video"]:
@@ -1422,6 +1422,25 @@ class LeRobotSingleDataset(Dataset):
                 state.append(data[state_key])
             state = np.concatenate(state, axis=1).astype(np.float16)
             sample["state"] = state
+
+        # VGGT is intentionally kept outside the LeRobot video pipeline. When
+        # configured, attach a path to an offline feature tensor so the model
+        # framework can load it lazily for the current step. The default
+        # pattern is compatible with one [N,C] tensor per observation.
+        if self.data_cfg is not None:
+            feature_root = self.data_cfg.get("vggt_feature_root", "")
+            if feature_root:
+                pattern = self.data_cfg.get(
+                    "vggt_feature_pattern",
+                    "{dataset}/{trajectory_id}/{base_index}.pt",
+                )
+                relative_path = str(pattern).format(
+                    dataset=self.dataset_name,
+                    trajectory_id=trajectory_id,
+                    base_index=base_index,
+                )
+                feature_key = self.data_cfg.get("vggt_feature_key", "vggt")
+                sample[str(feature_key)] = str(Path(feature_root) / relative_path)
 
         return sample
 

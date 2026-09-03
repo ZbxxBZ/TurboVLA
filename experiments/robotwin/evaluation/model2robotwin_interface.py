@@ -473,6 +473,11 @@ def eval(TASK_ENV, model, observation):
         "image": images,
         "state": state,  # Required for delta/rel action modes
     }
+    # Optional precomputed VGGT tokens can be injected by an evaluation
+    # pipeline. The TurboVLA framework consumes them under ``vggt`` when
+    # 3D-MIX is enabled; the standard RGB-only path remains unchanged.
+    if "vggt" in observation:
+        example["vggt"] = observation["vggt"]
 
     action = model.step(example, step=TASK_ENV.take_action_cnt)
 

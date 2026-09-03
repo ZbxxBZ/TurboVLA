@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
+from .three_dmix import ThreeDMixConfig
+
 
 @dataclass
 class TextEncoderConfig:
@@ -69,6 +71,7 @@ class TurboVLAConfig:
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
     action: ActionHeadConfig = field(default_factory=ActionHeadConfig)
+    three_dmix: ThreeDMixConfig = field(default_factory=ThreeDMixConfig)
 
     def __post_init__(self) -> None:
         if self.name != "TurboVLA":
@@ -114,4 +117,5 @@ class TurboVLAConfig:
             vision=VisionEncoderConfig(**dict(data.get("vision", {}))),
             interaction=InteractionConfig(**dict(data.get("interaction", {}))),
             action=ActionHeadConfig(**dict(data.get("action", {}))),
+            three_dmix=ThreeDMixConfig(**dict(data.get("three_dmix", {}))),
         )

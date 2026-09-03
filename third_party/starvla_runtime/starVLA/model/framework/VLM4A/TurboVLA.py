@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -18,6 +19,7 @@ from turbovla.models import TurboVLAConfig, build_turbovla
 from turbovla.models.configuration import (
     ActionHeadConfig,
     InteractionConfig,
+    ThreeDMixConfig,
     TextEncoderConfig,
     VisionEncoderConfig,
 )
@@ -63,6 +65,15 @@ class TurboVLADefaultConfig:
             "residual_style": "pre_norm",
             "attention_backend": "sdpa",
             "compute_precision": "bf16_autocast",
+        }
+    )
+    three_dmix: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "vggt_dim": 2048,
+            "semantic_pool": "vl",
+            "output_scale_init": 0.0,
+            "feature_key": "vggt",
         }
     )
     initialization: dict = field(
@@ -154,6 +165,12 @@ class TurboVLAFramework(baseframework):
                 attention_backend=str(fw.interaction.attention_backend),
                 compute_precision=str(fw.interaction.compute_precision),
             ),
+            three_dmix=ThreeDMixConfig(
+                enabled=bool(fw.three_dmix.enabled),
+                vggt_dim=int(fw.three_dmix.vggt_dim),
+                semantic_pool=str(fw.three_dmix.semantic_pool),
+                output_scale_init=float(fw.three_dmix.output_scale_init),
+            ),
             action=ActionHeadConfig(
                 action_dim=int(fw.action.action_dim),
                 state_dim=int(fw.action.state_dim),
@@ -178,7 +195,12 @@ class TurboVLAFramework(baseframework):
         path = str(init_cfg.pretrained_ckpt)
         if not path:
             raise ValueError("framework.initialization.pretrained_ckpt is required")
-        source = self._checkpoint_state(torch.load(path, map_location="cpu"))
+        if path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            source = load_file(path, device="cpu")
+        else:
+            source = self._checkpoint_state(torch.load(path, map_location="cpu"))
         source = {(key[7:] if key.startswith("module.") else key): value for key, value in source.items()}
         mappings = []
         if init_cfg.load_bert:
@@ -195,6 +217,23 @@ class TurboVLAFramework(baseframework):
         target = self.model.state_dict()
         loaded = {}
         for source_key, value in source.items():
+            # Continue-training checkpoints produced by this TurboVLA model
+            # already use the target names. Also accept a common `model.`
+            # wrapper prefix before falling back to legacy StarVLA mappings.
+            direct_candidates = [source_key]
+            if source_key.startswith("model."):
+                direct_candidates.append(source_key[len("model.") :])
+            direct_key = next(
+                (
+                    candidate
+                    for candidate in direct_candidates
+                    if candidate in target and tuple(target[candidate].shape) == tuple(value.shape)
+                ),
+                None,
+            )
+            if direct_key is not None:
+                loaded[direct_key] = value
+                continue
             for source_prefix, target_prefix in mappings:
                 if not source_key.startswith(source_prefix):
                     continue
@@ -232,7 +271,72 @@ class TurboVLAFramework(baseframework):
             device=device,
             dtype=torch.float32,
         )
-        return instructions, {"dinov3": pixel_values}, states
+        samples = {"dinov3": pixel_values}
+        if bool(self.config.framework.three_dmix.enabled):
+            feature_key = str(self.config.framework.three_dmix.get("feature_key", "vggt"))
+            features = [
+                self._load_vggt_feature(example.get(feature_key), index)
+                for index, example in enumerate(examples)
+            ]
+            if any(feature is None for feature in features):
+                raise ValueError(
+                    "ThreeDMix is enabled but RoboTwin examples do not provide "
+                    f"{feature_key!r}. Add cached VGGT tensors to each example or configure a feature cache."
+                )
+            try:
+                samples["vggt"] = torch.stack(
+                    [feature for feature in features if feature is not None], dim=0
+                ).to(device)
+            except RuntimeError as exc:
+                shapes = [tuple(feature.shape) for feature in features if feature is not None]
+                raise ValueError(f"VGGT feature shapes must match across a batch, got {shapes}") from exc
+        return instructions, samples, states
+
+    @staticmethod
+    def _load_vggt_feature(value, index: int) -> torch.Tensor | None:
+        """Normalize an inline tensor/array or an offline feature path."""
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            feature = value.detach().cpu()
+        elif isinstance(value, np.ndarray):
+            feature = torch.from_numpy(value)
+        elif isinstance(value, (str, Path)):
+            path = Path(value)
+            if not path.exists():
+                raise FileNotFoundError(f"VGGT feature for example {index} not found: {path}")
+            if path.suffix.lower() in {".pt", ".pth", ".bin"}:
+                try:
+                    loaded = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    loaded = torch.load(path, map_location="cpu")
+                if isinstance(loaded, dict):
+                    for key in ("features", "vggt", "patch_tokens"):
+                        if key in loaded:
+                            loaded = loaded[key]
+                            break
+                if not isinstance(loaded, torch.Tensor):
+                    loaded = torch.as_tensor(loaded)
+                feature = loaded
+            elif path.suffix.lower() in {".npy", ".npz"}:
+                loaded = np.load(path)
+                if isinstance(loaded, np.lib.npyio.NpzFile):
+                    key = "features" if "features" in loaded.files else loaded.files[0]
+                    loaded = loaded[key]
+                feature = torch.from_numpy(np.asarray(loaded))
+            else:
+                raise ValueError(f"Unsupported VGGT feature file type: {path.suffix}")
+        else:
+            feature = torch.as_tensor(value)
+        if feature.ndim == 1:
+            feature = feature.unsqueeze(0)
+        if feature.ndim == 3:
+            feature = feature.flatten(0, 1)
+        if feature.ndim != 2:
+            raise ValueError(
+                f"VGGT feature for example {index} must be [N,C] or [V,N,C], got {tuple(feature.shape)}"
+            )
+        return feature.float()
 
     def forward(self, examples: List[dict] = None, **kwargs):
         del kwargs
@@ -287,6 +391,10 @@ class TurboVLAFramework(baseframework):
     @property
     def vision_projection(self):
         return self.model.vision_projection
+
+    @property
+    def three_dmix(self):
+        return self.model.three_dmix
 
     @property
     def action_head(self):

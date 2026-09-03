@@ -14,10 +14,12 @@ from .configuration import (
     ActionHeadConfig,
     InteractionConfig,
     TextEncoderConfig,
+    ThreeDMixConfig,
     TurboVLAConfig,
     VisionEncoderConfig,
 )
 from .text_encoder import TurboVLATextEncoder
+from .three_dmix import ThreeDMix
 from .vision_encoder import DINOv3VisionEncoder
 
 
@@ -134,6 +136,16 @@ class TurboVLA(nn.Module):
             nheads=config.interaction.nheads,
             dim_feedforward=config.interaction.dim_feedforward,
         )
+        self.three_dmix = (
+            ThreeDMix(
+                hidden_dim=hidden_dim,
+                vggt_dim=config.three_dmix.vggt_dim,
+                semantic_pool=config.three_dmix.semantic_pool,
+                output_scale_init=config.three_dmix.output_scale_init,
+            )
+            if config.three_dmix.enabled
+            else None
+        )
 
     def _normalize_samples(self, samples: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(samples, Mapping):
@@ -192,6 +204,19 @@ class TurboVLA(nn.Module):
                 text_key_padding_mask=text_key_padding_mask,
                 text_self_attention_masks=text_self_attention_masks,
             )
+            if self.three_dmix is not None:
+                if not isinstance(samples, Mapping) or "vggt" not in samples:
+                    raise ValueError(
+                        "ThreeDMix is enabled but samples does not contain 'vggt'. "
+                        "Provide cached VGGT tokens shaped [B,N,C_vggt]."
+                    )
+                fused_3d, _ = self.three_dmix(
+                    visual_tokens=visual_tokens,
+                    text_tokens=text_tokens,
+                    text_key_padding_mask=text_key_padding_mask,
+                    vggt_features=samples["vggt"],
+                )
+                return torch.cat([visual_tokens, text_tokens, fused_3d], dim=1)
             return torch.cat([visual_tokens, text_tokens], dim=1)
 
     def forward(
@@ -278,6 +303,12 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 residual_style=str(_arg(args, "residual_style", "normalized")),
                 attention_backend=str(_arg(args, "attention_backend", "manual")),
                 compute_precision=str(_arg(args, "interaction_precision", "fp32")),
+            ),
+            three_dmix=ThreeDMixConfig(
+                enabled=bool(_arg(args, "enable_3dmix", False)),
+                vggt_dim=int(_arg(args, "vggt_dim", 2048)),
+                semantic_pool=str(_arg(args, "semantic_pool", "vl")),
+                output_scale_init=float(_arg(args, "three_dmix_output_scale_init", 0.0)),
             ),
             action=ActionHeadConfig(
                 action_dim=int(_arg(args, "action_dim", 7)),

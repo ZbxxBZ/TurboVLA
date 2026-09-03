@@ -33,6 +33,7 @@ tmp/
 *.parquet
 .hf_token
 .wandb_api_key
+vps_scripts/id_ed25519_turbovla_3dmix
 .*_token
 .*api_key
 .idea/
